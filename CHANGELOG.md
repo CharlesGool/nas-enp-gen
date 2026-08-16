@@ -4,4 +4,18 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
-No release yet. Entries begin at `v0.1.0`.
+## v0.1.0 — first release
+
+### Added
+- Generator (`nas-enp-gen.py`): collects NAS connection details and mount mappings, AES-256-GCM encrypts them, and writes a self-contained Python client script — no compile step.
+- Bilingual (English/中文) PySide6 GUI, auto-detecting system locale with a manual language switch; `--cli` for terminal prompts and `--config`/`--out` for headless/scripted use.
+- Generator packaged as installable `.deb` (Linux, built and verified locally) and `.exe` (Windows, built via GitHub Actions CI on tag push).
+- Generated client: CIFS and NFS mount support, idempotent `--oneshot` with retry/backoff, `--install-service`/`--uninstall` for a boot-time systemd unit that never blocks boot on a dead NAS, `--status`, `--selftest`.
+- **Machine binding** (`binding.mode: "machine"`): the client's decryption key is derived at runtime from the target machine's own hardware fingerprint (Scrypt-derived, multi-recipient envelope) instead of being embedded in the file — a leaked script is computationally useless off its bound machine(s). See `DESIGN.md` "Envelope format".
+- `--emit-collector`: writes a standalone, dependency-free script to collect a machine's fingerprint ahead of generation.
+- `binding.mode: "none"` compatibility path (XOR-split key, pre-existing scheme) for targets where fingerprints can't be pre-collected — no leak protection, documented as such.
+- Generation-time self-check: scans the written client script for plaintext/base64 leaks of host/username/password and aborts + deletes the output if found.
+- `tests/test_binding.py`: automated coverage of the machine-binding crypto (cross-machine failure, multi-slot, tamper detection, entropy gate, no-plaintext-leak, KDF timing, legacy-mode compatibility).
+
+### Security
+- Dedicated NAS account recommended in README's "Honest security note", which now documents machine binding's real leak protection vs. the structural limit (no protection against root already on a bound machine) separately from the `binding.mode: "none"` obfuscation-only path.

@@ -26,179 +26,356 @@ Requirements on each client machine (Debian/Ubuntu Linux, root):
   - Python 3.8+  with the `cryptography` package (auto-installed via pip
     by the client script itself on first run if missing)
 
+MACHINE BINDING
+---------------
+binding.mode = "machine" derives the client's decryption key from each
+target machine's hardware fingerprint (see DESIGN.md "Envelope format")
+instead of embedding a recoverable key. A file leaked off its bound
+machine(s) is computationally useless. This does NOT protect against an
+attacker with root on a bound machine — see the security reality check
+above, which still applies in full on that machine.
+Collect fingerprints on each target first:  nas-enp-gen.py --emit-collector
+
 Usage:
   python3 nas-enp-gen.py                       # launch the GUI
   python3 nas-enp-gen.py --cli                  # interactive terminal prompts
   python3 nas-enp-gen.py --config nas.json      # from a JSON file, headless
   python3 nas-enp-gen.py --config nas.json --out nas-enp-mount.py
+  python3 nas-enp-gen.py --emit-collector       # write a fingerprint collector
 """
-import argparse, base64, getpass, json, os, subprocess, sys
+import argparse, base64, getpass, hashlib, json, os, random, re, subprocess, sys
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 except ImportError:
     sys.exit("Missing dependency. Run:  pip install cryptography")
 
+# ---- Shared fingerprint-collection logic ----
+# The ONE canonical copy. Spliced verbatim into both the client template
+# (replacing the "# __FINGERPRINT_LOGIC__" marker below) and the
+# --emit-collector output, so the two places that read hardware
+# identifiers can never drift apart. See DECISIONS.md 2026-08-16
+# "Machine-fingerprint key derivation".
+FINGERPRINT_LOGIC_SRC = '''\
+_FP_PLACEHOLDERS = {
+    "", "none", "0", "default string", "to be filled by o.e.m.",
+    "not specified", "not applicable", "system serial number",
+    "unknown", "invalid", "00000000-0000-0000-0000-000000000000",
+}
+
+
+def _fp_read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _fp_valid(v):
+    return v is not None and v.strip().lower() not in _FP_PLACEHOLDERS
+
+
+def _fp_root_disk_serial():
+    try:
+        root_dev = None
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "/":
+                    root_dev = parts[0]
+                    break
+        if not root_dev or not root_dev.startswith("/dev/"):
+            return None
+        name = os.path.basename(os.path.realpath(root_dev))
+        if re.match(r"^nvme\\d+n\\d+p\\d+$", name):
+            base = re.sub(r"p\\d+$", "", name)
+        else:
+            base = re.sub(r"\\d+$", "", name)
+        return _fp_read(f"/sys/block/{base}/device/serial")
+    except Exception:
+        return None
+
+
+def collect_fingerprint():
+    """Collect this machine's hardware fingerprint.
+    Returns (fingerprint_hex, used[list[str]], skipped[list[str]]).
+    Raises SystemExit if product_uuid is unavailable or a placeholder —
+    this machine cannot be securely bound, and there is no lower-entropy
+    fallback (see DESIGN.md 'Envelope format', entropy gate)."""
+    if os.geteuid() != 0:
+        raise SystemExit("FATAL: fingerprint collection requires root (product_uuid is root-only).")
+
+    used = {}
+    skipped = []
+
+    product_uuid = _fp_read("/sys/class/dmi/id/product_uuid")
+    if _fp_valid(product_uuid):
+        used["product_uuid"] = product_uuid.strip().lower()
+    else:
+        skipped.append("product_uuid" + (" (placeholder)" if product_uuid else " (missing)"))
+
+    if "product_uuid" not in used:
+        raise SystemExit(
+            "FATAL: product_uuid unavailable or placeholder.\\n"
+            "This machine cannot be securely bound. Options:\\n"
+            "  - run as root (product_uuid is root-only)\\n"
+            "  - if this is a VM, ensure the hypervisor exposes a unique SMBIOS UUID\\n"
+            "  - fall back to binding.mode = \\"none\\" (NO leak protection, see DESIGN.md)"
+        )
+
+    board_serial = _fp_read("/sys/class/dmi/id/board_serial")
+    if _fp_valid(board_serial):
+        used["board_serial"] = board_serial.strip().lower()
+    else:
+        skipped.append("board_serial" + (" (placeholder)" if board_serial else " (missing)"))
+
+    product_serial = _fp_read("/sys/class/dmi/id/product_serial")
+    if _fp_valid(product_serial):
+        used["product_serial"] = product_serial.strip().lower()
+    else:
+        skipped.append("product_serial" + (" (placeholder)" if product_serial else " (missing)"))
+
+    disk_serial = _fp_root_disk_serial()
+    if _fp_valid(disk_serial):
+        used["disk_serial"] = disk_serial.strip().lower()
+    else:
+        skipped.append("disk_serial" + (" (placeholder)" if disk_serial else " (missing)"))
+
+    material = "\\n".join(f"{k}={used[k]}" for k in sorted(used))
+    fingerprint = hashlib.sha256(material.encode()).hexdigest()
+    return fingerprint, sorted(used), skipped
+
+
+def fingerprint_selector(fingerprint):
+    return hashlib.sha256((fingerprint + "nas-enp/selector/v2").encode()).digest()[:8].hex()
+'''
+
 # ---- Embedded Python client template (base64) ----
 PY_CLIENT_TEMPLATE_B64 = (
-    "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKbmFzLWVucC1tb3VudCBjbGllbnQKQnVpbHQgZnJvbSBhbiBlbmNyeXB0"
-    "ZWQgY29uZmlnIGJsb2IgZW1iZWRkZWQgYXQgZ2VuZXJhdGlvbiB0aW1lLgpUaGUgcGxhaW50ZXh0IGNvbmZpZyBuZXZl"
-    "ciB0b3VjaGVzIGRpc2sgb24gdGhlIGNsaWVudC4KIiIiCmltcG9ydCBiYXNlNjQKaW1wb3J0IGpzb24KaW1wb3J0IG9z"
-    "CmltcG9ydCBzdWJwcm9jZXNzCmltcG9ydCBzeXMKaW1wb3J0IHRpbWUKZnJvbSBzaHV0aWwgaW1wb3J0IHdoaWNoCgpJ"
-    "TlNUQUxMX0RJUiA9ICIvcm9vdC9uYXMtZW5wLW1vdW50IgpCSU5fTkFNRSA9ICJuYXMtZW5wLW1vdW50LnB5IgpTRVJW"
-    "SUNFX05BTUUgPSAibmFzLWVucC1tb3VudC5zZXJ2aWNlIgoKIyAtLS0tIEVtYmVkZGVkIGJsb2IgKGZpbGxlZCBpbiBi"
-    "eSB0aGUgZ2VuZXJhdG9yKSAtLS0tCkJMT0JfQ0lQSEVSID0gIl9fQ0lQSEVSVEVYVF9fIgpCTE9CX05PTkNFID0gIl9f"
-    "Tk9OQ0VfXyIKQkxPQl9LRVlBID0gIl9fS0VZQV9fIgpCTE9CX0tFWVBBRCA9ICJfX0tFWVBBRF9fIgoKCmRlZiBsb2dm"
-    "KG1zZyk6CiAgICBwcmludChmIltuYXMtZW5wLW1vdW50XSB7bXNnfSIsIGZpbGU9c3lzLnN0ZGVycikKCgpkZWYgX3Bp"
-    "cF9pbnN0YWxsKHBrZyk6CiAgICByID0gc3VicHJvY2Vzcy5ydW4oW3N5cy5leGVjdXRhYmxlLCAiLW0iLCAicGlwIiwg"
-    "Imluc3RhbGwiLCAiLS1xdWlldCIsIHBrZ10sCiAgICAgICAgICAgICAgICAgICAgICAgIGNhcHR1cmVfb3V0cHV0PVRy"
-    "dWUsIHRleHQ9VHJ1ZSkKICAgIGlmIHIucmV0dXJuY29kZSAhPSAwOgogICAgICAgICMgcGlwIG1vZHVsZSBtYXkgYmUg"
-    "bWlzc2luZyBlbnRpcmVseSBvbiBhIG1pbmltYWwgaW1hZ2U7IGJvb3RzdHJhcCBpdCBvbmNlLgogICAgICAgIHN1YnBy"
-    "b2Nlc3MucnVuKFtzeXMuZXhlY3V0YWJsZSwgIi1tIiwgImVuc3VyZXBpcCIsICItLWRlZmF1bHQtcGlwIl0sCiAgICAg"
-    "ICAgICAgICAgICAgICAgICAgIGNhcHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAgICAgICByID0gc3VicHJv"
-    "Y2Vzcy5ydW4oW3N5cy5leGVjdXRhYmxlLCAiLW0iLCAicGlwIiwgImluc3RhbGwiLCAiLS1xdWlldCIsIHBrZ10sCiAg"
-    "ICAgICAgICAgICAgICAgICAgICAgICAgICBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUpCiAgICByZXR1cm4g"
-    "cgoKCmRlZiBlbnN1cmVfY3J5cHRvKCk6CiAgICB0cnk6CiAgICAgICAgZnJvbSBjcnlwdG9ncmFwaHkuaGF6bWF0LnBy"
-    "aW1pdGl2ZXMuY2lwaGVycy5hZWFkIGltcG9ydCBBRVNHQ00KICAgICAgICByZXR1cm4gQUVTR0NNCiAgICBleGNlcHQg"
-    "SW1wb3J0RXJyb3I6CiAgICAgICAgbG9nZigiY3J5cHRvZ3JhcGh5IHBhY2thZ2UgbWlzc2luZzsgaW5zdGFsbGluZyB2"
-    "aWEgcGlwIC4uLiIpCiAgICAgICAgciA9IF9waXBfaW5zdGFsbCgiY3J5cHRvZ3JhcGh5IikKICAgICAgICBpZiByLnJl"
-    "dHVybmNvZGUgIT0gMDoKICAgICAgICAgICAgbG9nZihmImZhdGFsOiBwaXAgaW5zdGFsbCBjcnlwdG9ncmFwaHkgZmFp"
-    "bGVkOlxue3Iuc3Rkb3V0fXtyLnN0ZGVycn0iKQogICAgICAgICAgICBzeXMuZXhpdCgyKQogICAgICAgIHRyeToKICAg"
-    "ICAgICAgICAgZnJvbSBjcnlwdG9ncmFwaHkuaGF6bWF0LnByaW1pdGl2ZXMuY2lwaGVycy5hZWFkIGltcG9ydCBBRVNH"
-    "Q00KICAgICAgICAgICAgcmV0dXJuIEFFU0dDTQogICAgICAgIGV4Y2VwdCBJbXBvcnRFcnJvcjoKICAgICAgICAgICAg"
-    "bG9nZigiZmF0YWw6IGNyeXB0b2dyYXBoeSBzdGlsbCBub3QgaW1wb3J0YWJsZSBhZnRlciBpbnN0YWxsIikKICAgICAg"
-    "ICAgICAgc3lzLmV4aXQoMikKCgpBRVNHQ00gPSBlbnN1cmVfY3J5cHRvKCkKCgpkZWYgZGVjb2RlX2I2NChzKToKICAg"
-    "IHRyeToKICAgICAgICByZXR1cm4gYmFzZTY0LmI2NGRlY29kZShzKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgog"
-    "ICAgICAgIGxvZ2YoZiJmYXRhbDogYmxvYiBkZWNvZGUgZXJyb3I6IHtlfSIpCiAgICAgICAgc3lzLmV4aXQoMikKCgpk"
-    "ZWYgbG9hZF9jb25maWcoKToKICAgIGtleV9hID0gZGVjb2RlX2I2NChCTE9CX0tFWUEpCiAgICBrZXlfcGFkID0gZGVj"
-    "b2RlX2I2NChCTE9CX0tFWVBBRCkKICAgIGlmIGxlbihrZXlfYSkgIT0gbGVuKGtleV9wYWQpOgogICAgICAgIHJhaXNl"
-    "IFJ1bnRpbWVFcnJvcigia2V5IG1hdGVyaWFsIGxlbmd0aCBtaXNtYXRjaCIpCiAgICBrZXkgPSBieXRlYXJyYXkoYSBe"
-    "IGIgZm9yIGEsIGIgaW4gemlwKGtleV9hLCBrZXlfcGFkKSkKICAgIHRyeToKICAgICAgICBwbGFpbiA9IEFFU0dDTShi"
-    "eXRlcyhrZXkpKS5kZWNyeXB0KGRlY29kZV9iNjQoQkxPQl9OT05DRSksIGRlY29kZV9iNjQoQkxPQl9DSVBIRVIpLCBO"
-    "b25lKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHJhaXNlIFJ1bnRpbWVFcnJvcihmImNvbmZpZyBh"
-    "dXRoL2RlY3J5cHQgZmFpbGVkOiB7ZX0iKQogICAgZmluYWxseToKICAgICAgICAjIGJlc3QtZWZmb3J0IHplcm9pbmcg"
-    "b2YgdGhlIG11dGFibGUgY29weTsgdGhlIGJ5dGVzKCkgY29weSBwYXNzZWQgdG8KICAgICAgICAjIEFFU0dDTSBhYm92"
-    "ZSBpcyBpbW11dGFibGUgYW5kIGNhbid0IGJlIHplcm9lZCB0aGUgc2FtZSB3YXkKICAgICAgICBmb3IgaSBpbiByYW5n"
-    "ZShsZW4oa2V5KSk6CiAgICAgICAgICAgIGtleVtpXSA9IDAKICAgIHJldHVybiBqc29uLmxvYWRzKHBsYWluKQoKCmRl"
-    "ZiByZXF1aXJlX3Jvb3QoKToKICAgIGlmIG9zLmdldGV1aWQoKSAhPSAwOgogICAgICAgIGxvZ2YoImZhdGFsOiBtdXN0"
-    "IGJlIHJ1biBhcyByb290IikKICAgICAgICBzeXMuZXhpdCgxKQoKCmRlZiBpc19tb3VudGVkKHRhcmdldCk6CiAgICB0"
-    "cnk6CiAgICAgICAgd2l0aCBvcGVuKCIvcHJvYy9tb3VudHMiKSBhcyBmOgogICAgICAgICAgICBkYXRhID0gZi5yZWFk"
-    "KCkKICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgIHJldHVybiBGYWxzZQogICAgYWJzX3RhcmdldCA9IG9zLnBhdGgu"
-    "YWJzcGF0aCh0YXJnZXQpCiAgICBmb3IgbGluZSBpbiBkYXRhLnNwbGl0bGluZXMoKToKICAgICAgICBmaWVsZHMgPSBs"
-    "aW5lLnNwbGl0KCkKICAgICAgICBpZiBsZW4oZmllbGRzKSA+PSAyIGFuZCBmaWVsZHNbMV0gaW4gKGFic190YXJnZXQs"
-    "IHRhcmdldCk6CiAgICAgICAgICAgIHJldHVybiBUcnVlCiAgICByZXR1cm4gRmFsc2UKCgpkZWYgaGF2ZV9jbWQobmFt"
-    "ZSk6CiAgICByZXR1cm4gd2hpY2gobmFtZSkgaXMgbm90IE5vbmUKCgpkZWYgZW5zdXJlX2RlcHMoY2ZnKToKICAgIGlm"
-    "IGNmZ1sicHJvdG9jb2wiXSA9PSAiY2lmcyIgYW5kIG5vdCBoYXZlX2NtZCgibW91bnQuY2lmcyIpOgogICAgICAgIGlm"
-    "IGNmZy5nZXQoImluc3RhbGxfZGVwcyIpIGFuZCBoYXZlX2NtZCgiYXB0LWdldCIpOgogICAgICAgICAgICBsb2dmKCJt"
-    "b3VudC5jaWZzIG1pc3Npbmc7IGluc3RhbGxpbmcgY2lmcy11dGlscyAuLi4iKQogICAgICAgICAgICBlbnYgPSBkaWN0"
-    "KG9zLmVudmlyb24sIERFQklBTl9GUk9OVEVORD0ibm9uaW50ZXJhY3RpdmUiKQogICAgICAgICAgICByID0gc3VicHJv"
-    "Y2Vzcy5ydW4oWyJhcHQtZ2V0IiwgImluc3RhbGwiLCAiLXkiLCAiY2lmcy11dGlscyJdLAogICAgICAgICAgICAgICAg"
-    "ICAgICAgICAgICAgICAgIGVudj1lbnYsIGNhcHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAgICAgICAgICAg"
-    "aWYgci5yZXR1cm5jb2RlICE9IDA6CiAgICAgICAgICAgICAgICBsb2dmKGYid2FybjogY2lmcy11dGlscyBpbnN0YWxs"
-    "IGZhaWxlZDoge3IucmV0dXJuY29kZX1cbntyLnN0ZG91dH17ci5zdGRlcnJ9IikKICAgICAgICBlbHNlOgogICAgICAg"
-    "ICAgICBsb2dmKCJ3YXJuOiBtb3VudC5jaWZzIG5vdCBmb3VuZDsgaW5zdGFsbCBjaWZzLXV0aWxzIChhcHQtZ2V0IGlu"
-    "c3RhbGwgY2lmcy11dGlscykiKQoKCmRlZiBidWlsZF9zb3VyY2UoY2ZnLCBtKToKICAgIGlmIGNmZ1sicHJvdG9jb2wi"
-    "XSA9PSAibmZzIjoKICAgICAgICByZXR1cm4gZid7Y2ZnWyJob3N0Il19OnttWyJyZW1vdGUiXX0nCiAgICByZW0gPSBt"
-    "WyJyZW1vdGUiXS5sc3RyaXAoIi8iKQogICAgcmV0dXJuIGYnLy97Y2ZnWyJob3N0Il19L3tyZW19JwoKCmRlZiBtb3Vu"
-    "dF9vbmUoY2ZnLCBtLCBpZHgpOgogICAgaWYgaXNfbW91bnRlZChtWyJsb2NhbCJdKToKICAgICAgICBsb2dmKGYibW91"
-    "bnQgI3tpZHh9OiBhbHJlYWR5IG1vdW50ZWQiKQogICAgICAgIHJldHVybiBUcnVlCiAgICB0cnk6CiAgICAgICAgb3Mu"
-    "bWFrZWRpcnMobVsibG9jYWwiXSwgbW9kZT0wbzc1NSwgZXhpc3Rfb2s9VHJ1ZSkKICAgIGV4Y2VwdCBPU0Vycm9yOgog"
-    "ICAgICAgIGxvZ2YoZiJtb3VudCAje2lkeH06IG1rZGlyIGZhaWxlZCIpCiAgICAgICAgcmV0dXJuIEZhbHNlCgogICAg"
-    "b3B0cyA9IGNmZy5nZXQoImRlZmF1bHRfb3B0aW9ucyIsICIiKQogICAgaWYgbS5nZXQoIm9wdGlvbnMiLCAiIikuc3Ry"
-    "aXAoKToKICAgICAgICBvcHRzID0gbVsib3B0aW9ucyJdCgogICAgc3JjID0gYnVpbGRfc291cmNlKGNmZywgbSkKICAg"
-    "IGlmIGNmZ1sicHJvdG9jb2wiXSA9PSAiY2lmcyI6CiAgICAgICAgcGFydHMgPSBbXQogICAgICAgIGlmIG9wdHM6CiAg"
-    "ICAgICAgICAgIHBhcnRzLmFwcGVuZChvcHRzKQogICAgICAgIHBhcnRzLmFwcGVuZCgidXNlcm5hbWU9IiArIGNmZ1si"
-    "dXNlcm5hbWUiXSkKICAgICAgICBpZiBjZmcuZ2V0KCJkb21haW4iKToKICAgICAgICAgICAgcGFydHMuYXBwZW5kKCJk"
-    "b21haW49IiArIGNmZ1siZG9tYWluIl0pCiAgICAgICAgZnVsbCA9ICIsIi5qb2luKHBhcnRzKQogICAgICAgIGVudiA9"
-    "IGRpY3Qob3MuZW52aXJvbiwgUEFTU1dEPWNmZy5nZXQoInBhc3N3b3JkIiwgIiIpKQogICAgICAgIGNtZCA9IFsibW91"
-    "bnQuY2lmcyIsIHNyYywgbVsibG9jYWwiXSwgIi1vIiwgZnVsbF0KICAgIGVsc2U6CiAgICAgICAgYXJncyA9IFsiLXQi"
-    "LCAibmZzIl0KICAgICAgICBpZiBvcHRzOgogICAgICAgICAgICBhcmdzICs9IFsiLW8iLCBvcHRzXQogICAgICAgIGFy"
-    "Z3MgKz0gW3NyYywgbVsibG9jYWwiXV0KICAgICAgICBjbWQgPSBbIm1vdW50Il0gKyBhcmdzCiAgICAgICAgZW52ID0g"
-    "b3MuZW52aXJvbi5jb3B5KCkKCiAgICAjIERlbGliZXJhdGVseSBkb24ndCBsb2cgY21kL3NyYy9tWyJsb2NhbCJdIG9y"
-    "IHRoZSBzdWJwcm9jZXNzJ3Mgb3duCiAgICAjIHN0ZG91dC9zdGRlcnI6IG1vdW50IHRvb2wgZXJyb3IgdGV4dCBjYW4g"
-    "aXRzZWxmIGVtYmVkIHRoZSBOQVMgaG9zdAogICAgIyBvciBzaGFyZSBwYXRoLCBhbmQgdGhpcyBwcm9qZWN0J3MgcG9s"
-    "aWN5IGlzIHRvIG5ldmVyIHN1cmZhY2UgTkFTCiAgICAjIGlkZW50aWZ5aW5nIGRldGFpbHMgaW4gbG9ncyAoam91cm5h"
-    "bGN0bCBldGMuKSDigJQgb25seSBzdWNjZXNzL2ZhaWx1cmUuCiAgICByID0gc3VicHJvY2Vzcy5ydW4oY21kLCBlbnY9"
-    "ZW52LCBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUpCiAgICBpZiByLnJldHVybmNvZGUgIT0gMDoKICAgICAg"
-    "ICBsb2dmKGYibW91bnQgI3tpZHh9OiBmYWlsZWQgKGV4aXQgY29kZSB7ci5yZXR1cm5jb2RlfSkiKQogICAgICAgIHJl"
-    "dHVybiBGYWxzZQogICAgbG9nZihmIm1vdW50ICN7aWR4fTogbW91bnRlZCIpCiAgICByZXR1cm4gVHJ1ZQoKCmRlZiBv"
-    "bmVzaG90KCk6CiAgICByZXF1aXJlX3Jvb3QoKQogICAgdHJ5OgogICAgICAgIGNmZyA9IGxvYWRfY29uZmlnKCkKICAg"
-    "IGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBsb2dmKGYiZmF0YWw6IHtlfSIpCiAgICAgICAgcmV0dXJuIDIK"
-    "ICAgIGVuc3VyZV9kZXBzKGNmZykKCiAgICBhdHRlbXB0cyA9IGNmZy5nZXQoInJldHJ5X2F0dGVtcHRzIikgb3IgMQog"
-    "ICAgaWYgYXR0ZW1wdHMgPCAxOgogICAgICAgIGF0dGVtcHRzID0gMQogICAgZGVsYXkgPSBjZmcuZ2V0KCJyZXRyeV9k"
-    "ZWxheV9zZWMiKSBvciA1CiAgICBpZiBkZWxheSA8PSAwOgogICAgICAgIGRlbGF5ID0gNQoKICAgIHRvdGFsID0gbGVu"
-    "KGNmZ1sibW91bnRzIl0pCiAgICBwZW5kaW5nID0gbGlzdChlbnVtZXJhdGUoY2ZnWyJtb3VudHMiXSwgc3RhcnQ9MSkp"
-    "CiAgICBhdHRlbXB0ID0gMQogICAgd2hpbGUgYXR0ZW1wdCA8PSBhdHRlbXB0cyBhbmQgcGVuZGluZzoKICAgICAgICBz"
-    "dGlsbF9wZW5kaW5nID0gW10KICAgICAgICBmb3IgaWR4LCBtIGluIHBlbmRpbmc6CiAgICAgICAgICAgIGlmIG5vdCBt"
-    "b3VudF9vbmUoY2ZnLCBtLCBpZHgpOgogICAgICAgICAgICAgICAgc3RpbGxfcGVuZGluZy5hcHBlbmQoKGlkeCwgbSkp"
-    "CiAgICAgICAgcGVuZGluZyA9IHN0aWxsX3BlbmRpbmcKICAgICAgICBpZiBwZW5kaW5nIGFuZCBhdHRlbXB0IDwgYXR0"
-    "ZW1wdHM6CiAgICAgICAgICAgIGQgPSBtaW4oZGVsYXkgKiBhdHRlbXB0LCA2MCkKICAgICAgICAgICAgbG9nZihmInts"
-    "ZW4ocGVuZGluZyl9L3t0b3RhbH0gbW91bnQocykgcGVuZGluZywgcmV0cnlpbmcgaW4ge2R9cyAuLi4iKQogICAgICAg"
-    "ICAgICB0aW1lLnNsZWVwKGQpCiAgICAgICAgYXR0ZW1wdCArPSAxCgogICAgaWYgcGVuZGluZzoKICAgICAgICBsb2dm"
-    "KGYiZ2l2aW5nIHVwOiB7bGVuKHBlbmRpbmcpfS97dG90YWx9IG1vdW50KHMpIG5vdCBtb3VudGVkIikKICAgICAgICBy"
-    "ZXR1cm4gMSAgIyBub256ZXJvLCBidXQgYm9vdCBpcyB1bmFmZmVjdGVkIGJlY2F1c2Ugbm90aGluZyBkZXBlbmRzIG9u"
-    "IHRoaXMgdW5pdAogICAgbG9nZihmImFsbCB7dG90YWx9IG1vdW50KHMpIHVwIikKICAgIHJldHVybiAwCgoKZGVmIHN0"
-    "YXR1cygpOgogICAgdHJ5OgogICAgICAgIGNmZyA9IGxvYWRfY29uZmlnKCkKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMg"
-    "ZToKICAgICAgICBsb2dmKGYiZmF0YWw6IHtlfSIpCiAgICAgICAgcmV0dXJuIDIKICAgIHRvdGFsID0gbGVuKGNmZ1si"
-    "bW91bnRzIl0pCiAgICBtb3VudGVkID0gc3VtKDEgZm9yIG0gaW4gY2ZnWyJtb3VudHMiXSBpZiBpc19tb3VudGVkKG1b"
-    "ImxvY2FsIl0pKQogICAgcHJpbnQoZiJ7bW91bnRlZH0ve3RvdGFsfSBtb3VudChzKSBhY3RpdmUiKQogICAgcmV0dXJu"
-    "IDAKCgpkZWYgc2VsZnRlc3QoKToKICAgIHRyeToKICAgICAgICBjZmcgPSBsb2FkX2NvbmZpZygpCiAgICBleGNlcHQg"
-    "RXhjZXB0aW9uIGFzIGU6CiAgICAgICAgbG9nZihmInNlbGZ0ZXN0IEZBSUxFRDoge2V9IikKICAgICAgICByZXR1cm4g"
-    "MgogICAgcHJpbnQoZidjb25maWcgZGVjcnlwdGVkIE9LOiBwcm90b2NvbD17Y2ZnWyJwcm90b2NvbCJdfSBtb3VudHM9"
-    "e2xlbihjZmdbIm1vdW50cyJdKX0nKQogICAgcmV0dXJuIDAKCgpVTklUX1RFTVBMQVRFID0gIiIiW1VuaXRdCkRlc2Ny"
-    "aXB0aW9uPU5BUyBhdXRvIG1vdW50IChuYXMtZW5wLW1vdW50KQpBZnRlcj1uZXR3b3JrLW9ubGluZS50YXJnZXQKV2Fu"
-    "dHM9bmV0d29yay1vbmxpbmUudGFyZ2V0CiMgSW50ZW50aW9uYWxseSBubyBSZXF1aXJlcyBmcm9tIG90aGVyIHVuaXRz"
-    "IC0+IGZhaWx1cmVzIG5ldmVyIGJsb2NrIGJvb3QuClN0YXJ0TGltaXRJbnRlcnZhbFNlYz0wCgpbU2VydmljZV0KVHlw"
-    "ZT1vbmVzaG90ClJlbWFpbkFmdGVyRXhpdD15ZXMKRXhlY1N0YXJ0PXtweXRob259IHtzY3JpcHR9IC0tb25lc2hvdAoj"
-    "IEJvdW5kZWQgc28gYSBkZWFkIE5BUyBjYW4gbmV2ZXIgaGFuZyBib290OyByZXRyaWVzIGhhcHBlbiBpbnNpZGUgdGhp"
-    "cyBidWRnZXQuClRpbWVvdXRTdGFydFNlYz0xNTAKCltJbnN0YWxsXQpXYW50ZWRCeT1tdWx0aS11c2VyLnRhcmdldAoi"
-    "IiIKCgpkZWYgaW5zdGFsbF9zZXJ2aWNlKCk6CiAgICByZXF1aXJlX3Jvb3QoKQogICAgdHJ5OgogICAgICAgIGxvYWRf"
-    "Y29uZmlnKCkKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBsb2dmKGYicmVmdXNpbmcgdG8gaW5zdGFs"
-    "bDoge2V9IikKICAgICAgICByZXR1cm4gMgogICAgb3MubWFrZWRpcnMoSU5TVEFMTF9ESVIsIG1vZGU9MG83MDAsIGV4"
-    "aXN0X29rPVRydWUpCiAgICB0YXJnZXQgPSBvcy5wYXRoLmpvaW4oSU5TVEFMTF9ESVIsIEJJTl9OQU1FKQogICAgc2Vs"
-    "Zl9wYXRoID0gb3MucGF0aC5hYnNwYXRoKF9fZmlsZV9fKQogICAgaWYgc2VsZl9wYXRoICE9IHRhcmdldDoKICAgICAg"
-    "ICB3aXRoIG9wZW4oc2VsZl9wYXRoLCAicmIiKSBhcyBmOgogICAgICAgICAgICBkYXRhID0gZi5yZWFkKCkKICAgICAg"
-    "ICB3aXRoIG9wZW4odGFyZ2V0LCAid2IiKSBhcyBmOgogICAgICAgICAgICBmLndyaXRlKGRhdGEpCiAgICAgICAgb3Mu"
-    "Y2htb2QodGFyZ2V0LCAwbzcwMCkKICAgICAgICBsb2dmKGYiaW5zdGFsbGVkIHNjcmlwdCB0byB7dGFyZ2V0fSIpCgog"
-    "ICAgdW5pdCA9IFVOSVRfVEVNUExBVEUuZm9ybWF0KHB5dGhvbj1zeXMuZXhlY3V0YWJsZSwgc2NyaXB0PXRhcmdldCkK"
-    "ICAgIHVuaXRfcGF0aCA9IGYiL2V0Yy9zeXN0ZW1kL3N5c3RlbS97U0VSVklDRV9OQU1FfSIKICAgIHdpdGggb3Blbih1"
-    "bml0X3BhdGgsICJ3IikgYXMgZjoKICAgICAgICBmLndyaXRlKHVuaXQpCiAgICBsb2dmKGYid3JvdGUge3VuaXRfcGF0"
-    "aH0iKQogICAgZm9yIGFyZ3MgaW4gKFsiZGFlbW9uLXJlbG9hZCJdLCBbImVuYWJsZSIsIFNFUlZJQ0VfTkFNRV0sIFsi"
-    "c3RhcnQiLCBTRVJWSUNFX05BTUVdKToKICAgICAgICByID0gc3VicHJvY2Vzcy5ydW4oWyJzeXN0ZW1jdGwiXSArIGFy"
-    "Z3MsIGNhcHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAgICAgICBpZiByLnJldHVybmNvZGUgIT0gMDoKICAg"
-    "ICAgICAgICAgbG9nZihmIndhcm46IHN5c3RlbWN0bCB7YXJnc306IHtyLnJldHVybmNvZGV9OiB7KHIuc3Rkb3V0ICsg"
-    "ci5zdGRlcnIpLnN0cmlwKCl9IikKICAgIGxvZ2YoZiJzZXJ2aWNlIGluc3RhbGxlZCBhbmQgc3RhcnRlZC4gQ2hlY2s6"
-    "IHN5c3RlbWN0bCBzdGF0dXMge1NFUlZJQ0VfTkFNRX0iKQogICAgcmV0dXJuIDAKCgpkZWYgdW5pbnN0YWxsKCk6CiAg"
-    "ICByZXF1aXJlX3Jvb3QoKQogICAgc3VicHJvY2Vzcy5ydW4oWyJzeXN0ZW1jdGwiLCAiZGlzYWJsZSIsICItLW5vdyIs"
-    "IFNFUlZJQ0VfTkFNRV0sIGNhcHR1cmVfb3V0cHV0PVRydWUpCiAgICB0cnk6CiAgICAgICAgb3MucmVtb3ZlKGYiL2V0"
-    "Yy9zeXN0ZW1kL3N5c3RlbS97U0VSVklDRV9OQU1FfSIpCiAgICBleGNlcHQgT1NFcnJvcjoKICAgICAgICBwYXNzCiAg"
-    "ICBzdWJwcm9jZXNzLnJ1bihbInN5c3RlbWN0bCIsICJkYWVtb24tcmVsb2FkIl0sIGNhcHR1cmVfb3V0cHV0PVRydWUp"
-    "CiAgICB0cnk6CiAgICAgICAgY2ZnID0gbG9hZF9jb25maWcoKQogICAgICAgIHVubW91bnRlZCA9IDAKICAgICAgICBm"
-    "b3IgbSBpbiBjZmdbIm1vdW50cyJdOgogICAgICAgICAgICBpZiBpc19tb3VudGVkKG1bImxvY2FsIl0pOgogICAgICAg"
-    "ICAgICAgICAgciA9IHN1YnByb2Nlc3MucnVuKFsidW1vdW50IiwgbVsibG9jYWwiXV0sIGNhcHR1cmVfb3V0cHV0PVRy"
-    "dWUsIHRleHQ9VHJ1ZSkKICAgICAgICAgICAgICAgIGlmIHIucmV0dXJuY29kZSA9PSAwOgogICAgICAgICAgICAgICAg"
-    "ICAgIHVubW91bnRlZCArPSAxCiAgICAgICAgbG9nZihmInVubW91bnRlZCB7dW5tb3VudGVkfSBzaGFyZShzKSIpCiAg"
-    "ICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgIHBhc3MKICAgIGxvZ2YoInVuaW5zdGFsbGVkIikKICAgIHJldHVybiAw"
-    "CgoKZGVmIHVzYWdlKCk6CiAgICBwcmludCgiIiJuYXMtZW5wLW1vdW50CiAgKG5vIGFyZ3MpIC8gLS1vbmVzaG90ICAg"
-    "bW91bnQgYWxsIHNoYXJlcyBvbmNlICh3aXRoIGludGVybmFsIHJldHJpZXMpCiAgLS1pbnN0YWxsLXNlcnZpY2UgICAg"
-    "ICAgaW5zdGFsbCAmIGVuYWJsZSBzeXN0ZW1kIGJvb3Qgc2VydmljZQogIC0tdW5pbnN0YWxsICAgICAgICAgICAgIHN0"
-    "b3Agc2VydmljZSwgcmVtb3ZlIHVuaXQsIHVubW91bnQgc2hhcmVzCiAgLS1zdGF0dXMgICAgICAgICAgICAgICAgc2hv"
-    "dyBtb3VudCBzdGF0dXMKICAtLXNlbGZ0ZXN0ICAgICAgICAgICAgICB2ZXJpZnkgZW1iZWRkZWQgY29uZmlnIGRlY3J5"
-    "cHRzIChubyBzZWNyZXRzIHByaW50ZWQpIiIiKQoKCmRlZiBtYWluKCk6CiAgICBtb2RlID0gc3lzLmFyZ3ZbMV0gaWYg"
-    "bGVuKHN5cy5hcmd2KSA+IDEgZWxzZSAiLS1vbmVzaG90IgogICAgaWYgbW9kZSBpbiAoIi0tb25lc2hvdCIsICIiKToK"
-    "ICAgICAgICBzeXMuZXhpdChvbmVzaG90KCkpCiAgICBlbGlmIG1vZGUgPT0gIi0taW5zdGFsbC1zZXJ2aWNlIjoKICAg"
-    "ICAgICBzeXMuZXhpdChpbnN0YWxsX3NlcnZpY2UoKSkKICAgIGVsaWYgbW9kZSA9PSAiLS11bmluc3RhbGwiOgogICAg"
-    "ICAgIHN5cy5leGl0KHVuaW5zdGFsbCgpKQogICAgZWxpZiBtb2RlID09ICItLXN0YXR1cyI6CiAgICAgICAgc3lzLmV4"
-    "aXQoc3RhdHVzKCkpCiAgICBlbGlmIG1vZGUgPT0gIi0tc2VsZnRlc3QiOgogICAgICAgIHN5cy5leGl0KHNlbGZ0ZXN0"
-    "KCkpCiAgICBlbGlmIG1vZGUgaW4gKCItaCIsICItLWhlbHAiLCAiaGVscCIpOgogICAgICAgIHVzYWdlKCkKICAgIGVs"
-    "c2U6CiAgICAgICAgdXNhZ2UoKQogICAgICAgIHN5cy5leGl0KDIpCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoK"
-    "ICAgIG1haW4oKQo="
+    "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKbmFzLWVucC1tb3VudCBjbGllbnQKQnVpbHQgZnJvbSBhbiBlbmNyeXB0ZWQg"
+    "Y29uZmlnIGJsb2IgZW1iZWRkZWQgYXQgZ2VuZXJhdGlvbiB0aW1lLgpUaGUgcGxhaW50ZXh0IGNvbmZpZyBuZXZlciB0b3Vj"
+    "aGVzIGRpc2sgb24gdGhlIGNsaWVudC4KIiIiCmltcG9ydCBiYXNlNjQKaW1wb3J0IGhhc2hsaWIKaW1wb3J0IGpzb24KaW1w"
+    "b3J0IG9zCmltcG9ydCByZQppbXBvcnQgc3VicHJvY2VzcwppbXBvcnQgc3lzCmltcG9ydCB0aW1lCmZyb20gc2h1dGlsIGlt"
+    "cG9ydCB3aGljaAoKSU5TVEFMTF9ESVIgPSAiL3Jvb3QvbmFzLWVucC1tb3VudCIKQklOX05BTUUgPSAibmFzLWVucC1tb3Vu"
+    "dC5weSIKU0VSVklDRV9OQU1FID0gIm5hcy1lbnAtbW91bnQuc2VydmljZSIKCiMgLS0tLSBFbWJlZGRlZCBibG9iIChmaWxs"
+    "ZWQgaW4gYnkgdGhlIGdlbmVyYXRvcikgLS0tLQojIENPTkZJR19NT0RFIHNlbGVjdHMgd2hpY2ggZGVjcnlwdGlvbiBwYXRo"
+    "IGxvYWRfY29uZmlnKCkgdGFrZXM7IGJvdGgKIyBwYXRocycgY29kZSBzdGF5cyBpbiBldmVyeSBnZW5lcmF0ZWQgc2NyaXB0"
+    "LCBvbmx5IHRoZSBtb2RlIGRpZmZlcnMuCkNPTkZJR19NT0RFID0gIl9fQ09ORklHX01PREVfXyIgICMgImxlZ2FjeSIgb3Ig"
+    "ImVudmVsb3BlIgpCTE9CX0NJUEhFUiA9ICJfX0NJUEhFUlRFWFRfXyIKQkxPQl9OT05DRSA9ICJfX05PTkNFX18iCkJMT0Jf"
+    "S0VZQSA9ICJfX0tFWUFfXyIKQkxPQl9LRVlQQUQgPSAiX19LRVlQQURfXyIKQkxPQl9FTlZFTE9QRSA9ICJfX0VOVkVMT1BF"
+    "X18iCgpGSU5HRVJQUklOVF9NSVNNQVRDSF9NU0cgPSAoCiAgICAiZmluZ2VycHJpbnQgbWlzbWF0Y2g6IHRoaXMgY2xpZW50"
+    "IHdhcyBub3QgZ2VuZXJhdGVkIGZvciB0aGlzIG1hY2hpbmVcbiIKICAgICIob3IgdGhlIGhhcmR3YXJlIGNoYW5nZWQpLiBS"
+    "ZWdlbmVyYXRlIGl0IHdpdGggbmFzLWVucC1nZW4gdXNpbmcgdGhpc1xuIgogICAgIm1hY2hpbmUncyBjdXJyZW50IGZpbmdl"
+    "cnByaW50LiBSdW4gLS1zZWxmdGVzdCBmb3IgZGV0YWlscy4iCikKCgpkZWYgbG9nZihtc2cpOgogICAgcHJpbnQoZiJbbmFz"
+    "LWVucC1tb3VudF0ge21zZ30iLCBmaWxlPXN5cy5zdGRlcnIpCgoKZGVmIF9waXBfaW5zdGFsbChwa2cpOgogICAgciA9IHN1"
+    "YnByb2Nlc3MucnVuKFtzeXMuZXhlY3V0YWJsZSwgIi1tIiwgInBpcCIsICJpbnN0YWxsIiwgIi0tcXVpZXQiLCBwa2ddLAog"
+    "ICAgICAgICAgICAgICAgICAgICAgICBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUpCiAgICBpZiByLnJldHVybmNv"
+    "ZGUgIT0gMDoKICAgICAgICAjIHBpcCBtb2R1bGUgbWF5IGJlIG1pc3NpbmcgZW50aXJlbHkgb24gYSBtaW5pbWFsIGltYWdl"
+    "OyBib290c3RyYXAgaXQgb25jZS4KICAgICAgICBzdWJwcm9jZXNzLnJ1bihbc3lzLmV4ZWN1dGFibGUsICItbSIsICJlbnN1"
+    "cmVwaXAiLCAiLS1kZWZhdWx0LXBpcCJdLAogICAgICAgICAgICAgICAgICAgICAgICBjYXB0dXJlX291dHB1dD1UcnVlLCB0"
+    "ZXh0PVRydWUpCiAgICAgICAgciA9IHN1YnByb2Nlc3MucnVuKFtzeXMuZXhlY3V0YWJsZSwgIi1tIiwgInBpcCIsICJpbnN0"
+    "YWxsIiwgIi0tcXVpZXQiLCBwa2ddLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgY2FwdHVyZV9vdXRwdXQ9VHJ1ZSwg"
+    "dGV4dD1UcnVlKQogICAgcmV0dXJuIHIKCgpkZWYgZW5zdXJlX2NyeXB0bygpOgogICAgdHJ5OgogICAgICAgIGZyb20gY3J5"
+    "cHRvZ3JhcGh5Lmhhem1hdC5wcmltaXRpdmVzLmNpcGhlcnMuYWVhZCBpbXBvcnQgQUVTR0NNCiAgICAgICAgZnJvbSBjcnlw"
+    "dG9ncmFwaHkuaGF6bWF0LnByaW1pdGl2ZXMua2RmLnNjcnlwdCBpbXBvcnQgU2NyeXB0CiAgICAgICAgcmV0dXJuIEFFU0dD"
+    "TSwgU2NyeXB0CiAgICBleGNlcHQgSW1wb3J0RXJyb3I6CiAgICAgICAgbG9nZigiY3J5cHRvZ3JhcGh5IHBhY2thZ2UgbWlz"
+    "c2luZzsgaW5zdGFsbGluZyB2aWEgcGlwIC4uLiIpCiAgICAgICAgciA9IF9waXBfaW5zdGFsbCgiY3J5cHRvZ3JhcGh5IikK"
+    "ICAgICAgICBpZiByLnJldHVybmNvZGUgIT0gMDoKICAgICAgICAgICAgbG9nZihmImZhdGFsOiBwaXAgaW5zdGFsbCBjcnlw"
+    "dG9ncmFwaHkgZmFpbGVkOlxue3Iuc3Rkb3V0fXtyLnN0ZGVycn0iKQogICAgICAgICAgICBzeXMuZXhpdCgyKQogICAgICAg"
+    "IHRyeToKICAgICAgICAgICAgZnJvbSBjcnlwdG9ncmFwaHkuaGF6bWF0LnByaW1pdGl2ZXMuY2lwaGVycy5hZWFkIGltcG9y"
+    "dCBBRVNHQ00KICAgICAgICAgICAgZnJvbSBjcnlwdG9ncmFwaHkuaGF6bWF0LnByaW1pdGl2ZXMua2RmLnNjcnlwdCBpbXBv"
+    "cnQgU2NyeXB0CiAgICAgICAgICAgIHJldHVybiBBRVNHQ00sIFNjcnlwdAogICAgICAgIGV4Y2VwdCBJbXBvcnRFcnJvcjoK"
+    "ICAgICAgICAgICAgbG9nZigiZmF0YWw6IGNyeXB0b2dyYXBoeSBzdGlsbCBub3QgaW1wb3J0YWJsZSBhZnRlciBpbnN0YWxs"
+    "IikKICAgICAgICAgICAgc3lzLmV4aXQoMikKCgpBRVNHQ00sIFNjcnlwdCA9IGVuc3VyZV9jcnlwdG8oKQoKCmRlZiBkZWNv"
+    "ZGVfYjY0KHMpOgogICAgdHJ5OgogICAgICAgIHJldHVybiBiYXNlNjQuYjY0ZGVjb2RlKHMpCiAgICBleGNlcHQgRXhjZXB0"
+    "aW9uIGFzIGU6CiAgICAgICAgbG9nZihmImZhdGFsOiBibG9iIGRlY29kZSBlcnJvcjoge2V9IikKICAgICAgICBzeXMuZXhp"
+    "dCgyKQoKCiMgX19GSU5HRVJQUklOVF9MT0dJQ19fCgoKZGVmIGxvYWRfY29uZmlnX2xlZ2FjeSgpOgogICAga2V5X2EgPSBk"
+    "ZWNvZGVfYjY0KEJMT0JfS0VZQSkKICAgIGtleV9wYWQgPSBkZWNvZGVfYjY0KEJMT0JfS0VZUEFEKQogICAgaWYgbGVuKGtl"
+    "eV9hKSAhPSBsZW4oa2V5X3BhZCk6CiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJrZXkgbWF0ZXJpYWwgbGVuZ3RoIG1p"
+    "c21hdGNoIikKICAgIGtleSA9IGJ5dGVhcnJheShhIF4gYiBmb3IgYSwgYiBpbiB6aXAoa2V5X2EsIGtleV9wYWQpKQogICAg"
+    "dHJ5OgogICAgICAgIHBsYWluID0gQUVTR0NNKGJ5dGVzKGtleSkpLmRlY3J5cHQoZGVjb2RlX2I2NChCTE9CX05PTkNFKSwg"
+    "ZGVjb2RlX2I2NChCTE9CX0NJUEhFUiksIE5vbmUpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgcmFpc2Ug"
+    "UnVudGltZUVycm9yKGYiY29uZmlnIGF1dGgvZGVjcnlwdCBmYWlsZWQ6IHtlfSIpCiAgICBmaW5hbGx5OgogICAgICAgICMg"
+    "YmVzdC1lZmZvcnQgemVyb2luZyBvZiB0aGUgbXV0YWJsZSBjb3B5OyB0aGUgYnl0ZXMoKSBjb3B5IHBhc3NlZCB0bwogICAg"
+    "ICAgICMgQUVTR0NNIGFib3ZlIGlzIGltbXV0YWJsZSBhbmQgY2FuJ3QgYmUgemVyb2VkIHRoZSBzYW1lIHdheQogICAgICAg"
+    "IGZvciBpIGluIHJhbmdlKGxlbihrZXkpKToKICAgICAgICAgICAga2V5W2ldID0gMAogICAgcmV0dXJuIGpzb24ubG9hZHMo"
+    "cGxhaW4pCgoKZGVmIGxvYWRfY29uZmlnX2VudmVsb3BlKCk6CiAgICBlbnZlbG9wZSA9IGpzb24ubG9hZHMoZGVjb2RlX2I2"
+    "NChCTE9CX0VOVkVMT1BFKSkKICAgIGZpbmdlcnByaW50LCB1c2VkLCBza2lwcGVkID0gY29sbGVjdF9maW5nZXJwcmludCgp"
+    "CiAgICBzZWxlY3RvciA9IGZpbmdlcnByaW50X3NlbGVjdG9yKGZpbmdlcnByaW50KQogICAgc2xvdCA9IE5vbmUKICAgIGZv"
+    "ciBzIGluIGVudmVsb3BlWyJzbG90cyJdOgogICAgICAgIGlmIHNbInNlbGVjdG9yIl0gPT0gc2VsZWN0b3I6CiAgICAgICAg"
+    "ICAgIHNsb3QgPSBzCiAgICAgICAgICAgIGJyZWFrCiAgICBpZiBzbG90IGlzIE5vbmU6CiAgICAgICAgcmFpc2UgUnVudGlt"
+    "ZUVycm9yKEZJTkdFUlBSSU5UX01JU01BVENIX01TRykKCiAgICBrZGYgPSBlbnZlbG9wZVsia2RmIl0KICAgIHNhbHQgPSBk"
+    "ZWNvZGVfYjY0KHNsb3RbInNhbHQiXSkKICAgIGtlayA9IFNjcnlwdChzYWx0PXNhbHQsIGxlbmd0aD1rZGZbImRrbGVuIl0s"
+    "IG49a2RmWyJuIl0sIHI9a2RmWyJyIl0sIHA9a2RmWyJwIl0pLmRlcml2ZShmaW5nZXJwcmludC5lbmNvZGUoKSkKICAgIHRy"
+    "eToKICAgICAgICBkZWsgPSBBRVNHQ00oa2VrKS5kZWNyeXB0KGRlY29kZV9iNjQoc2xvdFsibm9uY2UiXSksIGRlY29kZV9i"
+    "NjQoc2xvdFsid3JhcHBlZF9kZWsiXSksIGIibmFzLWVucC9zbG90L3YyIikKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAg"
+    "ICAgIyBzZWxlY3RvciBjb2xsaXNpb24gb3IgZmlsZSBjb3JydXB0aW9uOyBmcm9tIHRoZSBvcGVyYXRvcidzIHBvaW50CiAg"
+    "ICAgICAgIyBvZiB2aWV3IHRoaXMgaXMgaW5kaXN0aW5ndWlzaGFibGUgZnJvbSAid3JvbmcgbWFjaGluZSIKICAgICAgICBy"
+    "YWlzZSBSdW50aW1lRXJyb3IoRklOR0VSUFJJTlRfTUlTTUFUQ0hfTVNHKQoKICAgIHBheWxvYWQgPSBlbnZlbG9wZVsicGF5"
+    "bG9hZCJdCiAgICB0cnk6CiAgICAgICAgcGxhaW4gPSBBRVNHQ00oZGVrKS5kZWNyeXB0KGRlY29kZV9iNjQocGF5bG9hZFsi"
+    "bm9uY2UiXSksIGRlY29kZV9iNjQocGF5bG9hZFsiY3QiXSksIGIibmFzLWVucC9wYXlsb2FkL3YyIikKICAgIGV4Y2VwdCBF"
+    "eGNlcHRpb246CiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKEZJTkdFUlBSSU5UX01JU01BVENIX01TRykKICAgIHJldHVy"
+    "biBqc29uLmxvYWRzKHBsYWluKQoKCmRlZiBsb2FkX2NvbmZpZygpOgogICAgaWYgQ09ORklHX01PREUgPT0gImVudmVsb3Bl"
+    "IjoKICAgICAgICByZXR1cm4gbG9hZF9jb25maWdfZW52ZWxvcGUoKQogICAgcmV0dXJuIGxvYWRfY29uZmlnX2xlZ2FjeSgp"
+    "CgoKZGVmIHJlcXVpcmVfcm9vdCgpOgogICAgaWYgb3MuZ2V0ZXVpZCgpICE9IDA6CiAgICAgICAgbG9nZigiZmF0YWw6IG11"
+    "c3QgYmUgcnVuIGFzIHJvb3QiKQogICAgICAgIHN5cy5leGl0KDEpCgoKZGVmIGlzX21vdW50ZWQodGFyZ2V0KToKICAgIHRy"
+    "eToKICAgICAgICB3aXRoIG9wZW4oIi9wcm9jL21vdW50cyIpIGFzIGY6CiAgICAgICAgICAgIGRhdGEgPSBmLnJlYWQoKQog"
+    "ICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgcmV0dXJuIEZhbHNlCiAgICBhYnNfdGFyZ2V0ID0gb3MucGF0aC5hYnNwYXRo"
+    "KHRhcmdldCkKICAgIGZvciBsaW5lIGluIGRhdGEuc3BsaXRsaW5lcygpOgogICAgICAgIGZpZWxkcyA9IGxpbmUuc3BsaXQo"
+    "KQogICAgICAgIGlmIGxlbihmaWVsZHMpID49IDIgYW5kIGZpZWxkc1sxXSBpbiAoYWJzX3RhcmdldCwgdGFyZ2V0KToKICAg"
+    "ICAgICAgICAgcmV0dXJuIFRydWUKICAgIHJldHVybiBGYWxzZQoKCmRlZiBoYXZlX2NtZChuYW1lKToKICAgIHJldHVybiB3"
+    "aGljaChuYW1lKSBpcyBub3QgTm9uZQoKCmRlZiBlbnN1cmVfZGVwcyhjZmcpOgogICAgaWYgY2ZnWyJwcm90b2NvbCJdID09"
+    "ICJjaWZzIiBhbmQgbm90IGhhdmVfY21kKCJtb3VudC5jaWZzIik6CiAgICAgICAgaWYgY2ZnLmdldCgiaW5zdGFsbF9kZXBz"
+    "IikgYW5kIGhhdmVfY21kKCJhcHQtZ2V0Iik6CiAgICAgICAgICAgIGxvZ2YoIm1vdW50LmNpZnMgbWlzc2luZzsgaW5zdGFs"
+    "bGluZyBjaWZzLXV0aWxzIC4uLiIpCiAgICAgICAgICAgIGVudiA9IGRpY3Qob3MuZW52aXJvbiwgREVCSUFOX0ZST05URU5E"
+    "PSJub25pbnRlcmFjdGl2ZSIpCiAgICAgICAgICAgIHIgPSBzdWJwcm9jZXNzLnJ1bihbImFwdC1nZXQiLCAiaW5zdGFsbCIs"
+    "ICIteSIsICJjaWZzLXV0aWxzIl0sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZW52PWVudiwgY2FwdHVyZV9v"
+    "dXRwdXQ9VHJ1ZSwgdGV4dD1UcnVlKQogICAgICAgICAgICBpZiByLnJldHVybmNvZGUgIT0gMDoKICAgICAgICAgICAgICAg"
+    "IGxvZ2YoZiJ3YXJuOiBjaWZzLXV0aWxzIGluc3RhbGwgZmFpbGVkOiB7ci5yZXR1cm5jb2RlfVxue3Iuc3Rkb3V0fXtyLnN0"
+    "ZGVycn0iKQogICAgICAgIGVsc2U6CiAgICAgICAgICAgIGxvZ2YoIndhcm46IG1vdW50LmNpZnMgbm90IGZvdW5kOyBpbnN0"
+    "YWxsIGNpZnMtdXRpbHMgKGFwdC1nZXQgaW5zdGFsbCBjaWZzLXV0aWxzKSIpCgoKZGVmIGJ1aWxkX3NvdXJjZShjZmcsIG0p"
+    "OgogICAgaWYgY2ZnWyJwcm90b2NvbCJdID09ICJuZnMiOgogICAgICAgIHJldHVybiBmJ3tjZmdbImhvc3QiXX06e21bInJl"
+    "bW90ZSJdfScKICAgIHJlbSA9IG1bInJlbW90ZSJdLmxzdHJpcCgiLyIpCiAgICByZXR1cm4gZicvL3tjZmdbImhvc3QiXX0v"
+    "e3JlbX0nCgoKZGVmIG1vdW50X29uZShjZmcsIG0sIGlkeCk6CiAgICBpZiBpc19tb3VudGVkKG1bImxvY2FsIl0pOgogICAg"
+    "ICAgIGxvZ2YoZiJtb3VudCAje2lkeH06IGFscmVhZHkgbW91bnRlZCIpCiAgICAgICAgcmV0dXJuIFRydWUKICAgIHRyeToK"
+    "ICAgICAgICBvcy5tYWtlZGlycyhtWyJsb2NhbCJdLCBtb2RlPTBvNzU1LCBleGlzdF9vaz1UcnVlKQogICAgZXhjZXB0IE9T"
+    "RXJyb3I6CiAgICAgICAgbG9nZihmIm1vdW50ICN7aWR4fTogbWtkaXIgZmFpbGVkIikKICAgICAgICByZXR1cm4gRmFsc2UK"
+    "CiAgICBvcHRzID0gY2ZnLmdldCgiZGVmYXVsdF9vcHRpb25zIiwgIiIpCiAgICBpZiBtLmdldCgib3B0aW9ucyIsICIiKS5z"
+    "dHJpcCgpOgogICAgICAgIG9wdHMgPSBtWyJvcHRpb25zIl0KCiAgICBzcmMgPSBidWlsZF9zb3VyY2UoY2ZnLCBtKQogICAg"
+    "aWYgY2ZnWyJwcm90b2NvbCJdID09ICJjaWZzIjoKICAgICAgICBwYXJ0cyA9IFtdCiAgICAgICAgaWYgb3B0czoKICAgICAg"
+    "ICAgICAgcGFydHMuYXBwZW5kKG9wdHMpCiAgICAgICAgcGFydHMuYXBwZW5kKCJ1c2VybmFtZT0iICsgY2ZnWyJ1c2VybmFt"
+    "ZSJdKQogICAgICAgIGlmIGNmZy5nZXQoImRvbWFpbiIpOgogICAgICAgICAgICBwYXJ0cy5hcHBlbmQoImRvbWFpbj0iICsg"
+    "Y2ZnWyJkb21haW4iXSkKICAgICAgICBmdWxsID0gIiwiLmpvaW4ocGFydHMpCiAgICAgICAgZW52ID0gZGljdChvcy5lbnZp"
+    "cm9uLCBQQVNTV0Q9Y2ZnLmdldCgicGFzc3dvcmQiLCAiIikpCiAgICAgICAgY21kID0gWyJtb3VudC5jaWZzIiwgc3JjLCBt"
+    "WyJsb2NhbCJdLCAiLW8iLCBmdWxsXQogICAgZWxzZToKICAgICAgICBhcmdzID0gWyItdCIsICJuZnMiXQogICAgICAgIGlm"
+    "IG9wdHM6CiAgICAgICAgICAgIGFyZ3MgKz0gWyItbyIsIG9wdHNdCiAgICAgICAgYXJncyArPSBbc3JjLCBtWyJsb2NhbCJd"
+    "XQogICAgICAgIGNtZCA9IFsibW91bnQiXSArIGFyZ3MKICAgICAgICBlbnYgPSBvcy5lbnZpcm9uLmNvcHkoKQoKICAgICMg"
+    "RGVsaWJlcmF0ZWx5IGRvbid0IGxvZyBjbWQvc3JjL21bImxvY2FsIl0gb3IgdGhlIHN1YnByb2Nlc3MncyBvd24KICAgICMg"
+    "c3Rkb3V0L3N0ZGVycjogbW91bnQgdG9vbCBlcnJvciB0ZXh0IGNhbiBpdHNlbGYgZW1iZWQgdGhlIE5BUyBob3N0CiAgICAj"
+    "IG9yIHNoYXJlIHBhdGgsIGFuZCB0aGlzIHByb2plY3QncyBwb2xpY3kgaXMgdG8gbmV2ZXIgc3VyZmFjZSBOQVMKICAgICMg"
+    "aWRlbnRpZnlpbmcgZGV0YWlscyBpbiBsb2dzIChqb3VybmFsY3RsIGV0Yy4pIOKAlCBvbmx5IHN1Y2Nlc3MvZmFpbHVyZS4K"
+    "ICAgIHIgPSBzdWJwcm9jZXNzLnJ1bihjbWQsIGVudj1lbnYsIGNhcHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAg"
+    "IGlmIHIucmV0dXJuY29kZSAhPSAwOgogICAgICAgIGxvZ2YoZiJtb3VudCAje2lkeH06IGZhaWxlZCAoZXhpdCBjb2RlIHty"
+    "LnJldHVybmNvZGV9KSIpCiAgICAgICAgcmV0dXJuIEZhbHNlCiAgICBsb2dmKGYibW91bnQgI3tpZHh9OiBtb3VudGVkIikK"
+    "ICAgIHJldHVybiBUcnVlCgoKZGVmIG9uZXNob3QoKToKICAgIHJlcXVpcmVfcm9vdCgpCiAgICB0cnk6CiAgICAgICAgY2Zn"
+    "ID0gbG9hZF9jb25maWcoKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIGxvZ2YoZiJmYXRhbDoge2V9IikK"
+    "ICAgICAgICByZXR1cm4gMgogICAgZW5zdXJlX2RlcHMoY2ZnKQoKICAgIGF0dGVtcHRzID0gY2ZnLmdldCgicmV0cnlfYXR0"
+    "ZW1wdHMiKSBvciAxCiAgICBpZiBhdHRlbXB0cyA8IDE6CiAgICAgICAgYXR0ZW1wdHMgPSAxCiAgICBkZWxheSA9IGNmZy5n"
+    "ZXQoInJldHJ5X2RlbGF5X3NlYyIpIG9yIDUKICAgIGlmIGRlbGF5IDw9IDA6CiAgICAgICAgZGVsYXkgPSA1CgogICAgdG90"
+    "YWwgPSBsZW4oY2ZnWyJtb3VudHMiXSkKICAgIHBlbmRpbmcgPSBsaXN0KGVudW1lcmF0ZShjZmdbIm1vdW50cyJdLCBzdGFy"
+    "dD0xKSkKICAgIGF0dGVtcHQgPSAxCiAgICB3aGlsZSBhdHRlbXB0IDw9IGF0dGVtcHRzIGFuZCBwZW5kaW5nOgogICAgICAg"
+    "IHN0aWxsX3BlbmRpbmcgPSBbXQogICAgICAgIGZvciBpZHgsIG0gaW4gcGVuZGluZzoKICAgICAgICAgICAgaWYgbm90IG1v"
+    "dW50X29uZShjZmcsIG0sIGlkeCk6CiAgICAgICAgICAgICAgICBzdGlsbF9wZW5kaW5nLmFwcGVuZCgoaWR4LCBtKSkKICAg"
+    "ICAgICBwZW5kaW5nID0gc3RpbGxfcGVuZGluZwogICAgICAgIGlmIHBlbmRpbmcgYW5kIGF0dGVtcHQgPCBhdHRlbXB0czoK"
+    "ICAgICAgICAgICAgZCA9IG1pbihkZWxheSAqIGF0dGVtcHQsIDYwKQogICAgICAgICAgICBsb2dmKGYie2xlbihwZW5kaW5n"
+    "KX0ve3RvdGFsfSBtb3VudChzKSBwZW5kaW5nLCByZXRyeWluZyBpbiB7ZH1zIC4uLiIpCiAgICAgICAgICAgIHRpbWUuc2xl"
+    "ZXAoZCkKICAgICAgICBhdHRlbXB0ICs9IDEKCiAgICBpZiBwZW5kaW5nOgogICAgICAgIGxvZ2YoZiJnaXZpbmcgdXA6IHts"
+    "ZW4ocGVuZGluZyl9L3t0b3RhbH0gbW91bnQocykgbm90IG1vdW50ZWQiKQogICAgICAgIHJldHVybiAxICAjIG5vbnplcm8s"
+    "IGJ1dCBib290IGlzIHVuYWZmZWN0ZWQgYmVjYXVzZSBub3RoaW5nIGRlcGVuZHMgb24gdGhpcyB1bml0CiAgICBsb2dmKGYi"
+    "YWxsIHt0b3RhbH0gbW91bnQocykgdXAiKQogICAgcmV0dXJuIDAKCgpkZWYgc3RhdHVzKCk6CiAgICB0cnk6CiAgICAgICAg"
+    "Y2ZnID0gbG9hZF9jb25maWcoKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIGxvZ2YoZiJmYXRhbDoge2V9"
+    "IikKICAgICAgICByZXR1cm4gMgogICAgdG90YWwgPSBsZW4oY2ZnWyJtb3VudHMiXSkKICAgIG1vdW50ZWQgPSBzdW0oMSBm"
+    "b3IgbSBpbiBjZmdbIm1vdW50cyJdIGlmIGlzX21vdW50ZWQobVsibG9jYWwiXSkpCiAgICBwcmludChmInttb3VudGVkfS97"
+    "dG90YWx9IG1vdW50KHMpIGFjdGl2ZSIpCiAgICByZXR1cm4gMAoKCmRlZiBzZWxmdGVzdCgpOgogICAgaWYgQ09ORklHX01P"
+    "REUgPT0gImVudmVsb3BlIjoKICAgICAgICB0cnk6CiAgICAgICAgICAgIGZpbmdlcnByaW50LCB1c2VkLCBza2lwcGVkID0g"
+    "Y29sbGVjdF9maW5nZXJwcmludCgpCiAgICAgICAgZXhjZXB0IFN5c3RlbUV4aXQgYXMgZToKICAgICAgICAgICAgbG9nZihm"
+    "InNlbGZ0ZXN0IEZBSUxFRDoge2V9IikKICAgICAgICAgICAgcmV0dXJuIDIKICAgICAgICBzZWxlY3RvciA9IGZpbmdlcnBy"
+    "aW50X3NlbGVjdG9yKGZpbmdlcnByaW50KQogICAgICAgIGVudmVsb3BlID0ganNvbi5sb2FkcyhkZWNvZGVfYjY0KEJMT0Jf"
+    "RU5WRUxPUEUpKQogICAgICAgIHNsb3RfZm91bmQgPSBhbnkoc1sic2VsZWN0b3IiXSA9PSBzZWxlY3RvciBmb3IgcyBpbiBl"
+    "bnZlbG9wZVsic2xvdHMiXSkKICAgICAgICBwcmludChmImZpbmdlcnByaW50IGNvbGxlY3RlZCBPSzogcHJlZml4PXtmaW5n"
+    "ZXJwcmludFs6OF19Li4uIGNvbXBvbmVudHMgdXNlZD17JywnLmpvaW4odXNlZCl9IikKICAgICAgICBpZiBza2lwcGVkOgog"
+    "ICAgICAgICAgICBwcmludChmImNvbXBvbmVudHMgc2tpcHBlZDogeycsJy5qb2luKHNraXBwZWQpfSIpCiAgICAgICAgcHJp"
+    "bnQoZiJzbG90IG1hdGNoOiB7J0ZPVU5EJyBpZiBzbG90X2ZvdW5kIGVsc2UgJ05PVCBGT1VORCd9IikKICAgICAgICBpZiBu"
+    "b3Qgc2xvdF9mb3VuZDoKICAgICAgICAgICAgbG9nZihmInNlbGZ0ZXN0IEZBSUxFRDoge0ZJTkdFUlBSSU5UX01JU01BVENI"
+    "X01TR30iKQogICAgICAgICAgICByZXR1cm4gMgogICAgdHJ5OgogICAgICAgIGNmZyA9IGxvYWRfY29uZmlnKCkKICAgIGV4"
+    "Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBsb2dmKGYic2VsZnRlc3QgRkFJTEVEOiB7ZX0iKQogICAgICAgIHJldHVy"
+    "biAyCiAgICBwcmludChmJ2NvbmZpZyBkZWNyeXB0ZWQgT0s6IHByb3RvY29sPXtjZmdbInByb3RvY29sIl19IG1vdW50cz17"
+    "bGVuKGNmZ1sibW91bnRzIl0pfScpCiAgICByZXR1cm4gMAoKClVOSVRfVEVNUExBVEUgPSAiIiJbVW5pdF0KRGVzY3JpcHRp"
+    "b249TkFTIGF1dG8gbW91bnQgKG5hcy1lbnAtbW91bnQpCkFmdGVyPW5ldHdvcmstb25saW5lLnRhcmdldApXYW50cz1uZXR3"
+    "b3JrLW9ubGluZS50YXJnZXQKIyBJbnRlbnRpb25hbGx5IG5vIFJlcXVpcmVzIGZyb20gb3RoZXIgdW5pdHMgLT4gZmFpbHVy"
+    "ZXMgbmV2ZXIgYmxvY2sgYm9vdC4KU3RhcnRMaW1pdEludGVydmFsU2VjPTAKCltTZXJ2aWNlXQpUeXBlPW9uZXNob3QKUmVt"
+    "YWluQWZ0ZXJFeGl0PXllcwpFeGVjU3RhcnQ9e3B5dGhvbn0ge3NjcmlwdH0gLS1vbmVzaG90CiMgQm91bmRlZCBzbyBhIGRl"
+    "YWQgTkFTIGNhbiBuZXZlciBoYW5nIGJvb3Q7IHJldHJpZXMgaGFwcGVuIGluc2lkZSB0aGlzIGJ1ZGdldC4KIyBGaW5nZXJw"
+    "cmludCBtaXNtYXRjaCAoYmluZGluZy5tb2RlPW1hY2hpbmUpIGlzIGEgcGVybWFuZW50IGVycm9yLCBub3QgYQojIHRyYW5z"
+    "aWVudCBvbmUsIHNvIGl0IG11c3Qgbm90IHRyaWdnZXIgYSBzeXN0ZW1kLWxldmVsIHJldHJ5IGxvb3AgZWl0aGVyOgojIG5v"
+    "IFJlc3RhcnQ9IGlzIHNldCBoZXJlLCBhbmQgU3RhcnRMaW1pdEludGVydmFsU2VjPTAgYWJvdmUgZGlzYWJsZXMgdGhlCiMg"
+    "dW5pdCdzIGF1dG9tYXRpYyByZXN0YXJ0LXJhdGUtbGltaXQgbWFjaGluZXJ5IGVudGlyZWx5LgpUaW1lb3V0U3RhcnRTZWM9"
+    "MTUwCgpbSW5zdGFsbF0KV2FudGVkQnk9bXVsdGktdXNlci50YXJnZXQKIiIiCgoKZGVmIGluc3RhbGxfc2VydmljZSgpOgog"
+    "ICAgcmVxdWlyZV9yb290KCkKICAgIHRyeToKICAgICAgICBsb2FkX2NvbmZpZygpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFz"
+    "IGU6CiAgICAgICAgbG9nZihmInJlZnVzaW5nIHRvIGluc3RhbGw6IHtlfSIpCiAgICAgICAgcmV0dXJuIDIKICAgIG9zLm1h"
+    "a2VkaXJzKElOU1RBTExfRElSLCBtb2RlPTBvNzAwLCBleGlzdF9vaz1UcnVlKQogICAgdGFyZ2V0ID0gb3MucGF0aC5qb2lu"
+    "KElOU1RBTExfRElSLCBCSU5fTkFNRSkKICAgIHNlbGZfcGF0aCA9IG9zLnBhdGguYWJzcGF0aChfX2ZpbGVfXykKICAgIGlm"
+    "IHNlbGZfcGF0aCAhPSB0YXJnZXQ6CiAgICAgICAgd2l0aCBvcGVuKHNlbGZfcGF0aCwgInJiIikgYXMgZjoKICAgICAgICAg"
+    "ICAgZGF0YSA9IGYucmVhZCgpCiAgICAgICAgd2l0aCBvcGVuKHRhcmdldCwgIndiIikgYXMgZjoKICAgICAgICAgICAgZi53"
+    "cml0ZShkYXRhKQogICAgICAgIG9zLmNobW9kKHRhcmdldCwgMG83MDApCiAgICAgICAgbG9nZihmImluc3RhbGxlZCBzY3Jp"
+    "cHQgdG8ge3RhcmdldH0iKQoKICAgIHVuaXQgPSBVTklUX1RFTVBMQVRFLmZvcm1hdChweXRob249c3lzLmV4ZWN1dGFibGUs"
+    "IHNjcmlwdD10YXJnZXQpCiAgICB1bml0X3BhdGggPSBmIi9ldGMvc3lzdGVtZC9zeXN0ZW0ve1NFUlZJQ0VfTkFNRX0iCiAg"
+    "ICB3aXRoIG9wZW4odW5pdF9wYXRoLCAidyIpIGFzIGY6CiAgICAgICAgZi53cml0ZSh1bml0KQogICAgbG9nZihmIndyb3Rl"
+    "IHt1bml0X3BhdGh9IikKICAgIGZvciBhcmdzIGluIChbImRhZW1vbi1yZWxvYWQiXSwgWyJlbmFibGUiLCBTRVJWSUNFX05B"
+    "TUVdLCBbInN0YXJ0IiwgU0VSVklDRV9OQU1FXSk6CiAgICAgICAgciA9IHN1YnByb2Nlc3MucnVuKFsic3lzdGVtY3RsIl0g"
+    "KyBhcmdzLCBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUpCiAgICAgICAgaWYgci5yZXR1cm5jb2RlICE9IDA6CiAg"
+    "ICAgICAgICAgIGxvZ2YoZiJ3YXJuOiBzeXN0ZW1jdGwge2FyZ3N9OiB7ci5yZXR1cm5jb2RlfTogeyhyLnN0ZG91dCArIHIu"
+    "c3RkZXJyKS5zdHJpcCgpfSIpCiAgICBsb2dmKGYic2VydmljZSBpbnN0YWxsZWQgYW5kIHN0YXJ0ZWQuIENoZWNrOiBzeXN0"
+    "ZW1jdGwgc3RhdHVzIHtTRVJWSUNFX05BTUV9IikKICAgIHJldHVybiAwCgoKZGVmIHVuaW5zdGFsbCgpOgogICAgcmVxdWly"
+    "ZV9yb290KCkKICAgIHN1YnByb2Nlc3MucnVuKFsic3lzdGVtY3RsIiwgImRpc2FibGUiLCAiLS1ub3ciLCBTRVJWSUNFX05B"
+    "TUVdLCBjYXB0dXJlX291dHB1dD1UcnVlKQogICAgdHJ5OgogICAgICAgIG9zLnJlbW92ZShmIi9ldGMvc3lzdGVtZC9zeXN0"
+    "ZW0ve1NFUlZJQ0VfTkFNRX0iKQogICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgcGFzcwogICAgc3VicHJvY2Vzcy5ydW4o"
+    "WyJzeXN0ZW1jdGwiLCAiZGFlbW9uLXJlbG9hZCJdLCBjYXB0dXJlX291dHB1dD1UcnVlKQogICAgdHJ5OgogICAgICAgIGNm"
+    "ZyA9IGxvYWRfY29uZmlnKCkKICAgICAgICB1bm1vdW50ZWQgPSAwCiAgICAgICAgZm9yIG0gaW4gY2ZnWyJtb3VudHMiXToK"
+    "ICAgICAgICAgICAgaWYgaXNfbW91bnRlZChtWyJsb2NhbCJdKToKICAgICAgICAgICAgICAgIHIgPSBzdWJwcm9jZXNzLnJ1"
+    "bihbInVtb3VudCIsIG1bImxvY2FsIl1dLCBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUpCiAgICAgICAgICAgICAg"
+    "ICBpZiByLnJldHVybmNvZGUgPT0gMDoKICAgICAgICAgICAgICAgICAgICB1bm1vdW50ZWQgKz0gMQogICAgICAgIGxvZ2Yo"
+    "ZiJ1bm1vdW50ZWQge3VubW91bnRlZH0gc2hhcmUocykiKQogICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICBwYXNzCiAg"
+    "ICBsb2dmKCJ1bmluc3RhbGxlZCIpCiAgICByZXR1cm4gMAoKCmRlZiB1c2FnZSgpOgogICAgcHJpbnQoIiIibmFzLWVucC1t"
+    "b3VudAogIChubyBhcmdzKSAvIC0tb25lc2hvdCAgIG1vdW50IGFsbCBzaGFyZXMgb25jZSAod2l0aCBpbnRlcm5hbCByZXRy"
+    "aWVzKQogIC0taW5zdGFsbC1zZXJ2aWNlICAgICAgIGluc3RhbGwgJiBlbmFibGUgc3lzdGVtZCBib290IHNlcnZpY2UKICAt"
+    "LXVuaW5zdGFsbCAgICAgICAgICAgICBzdG9wIHNlcnZpY2UsIHJlbW92ZSB1bml0LCB1bm1vdW50IHNoYXJlcwogIC0tc3Rh"
+    "dHVzICAgICAgICAgICAgICAgIHNob3cgbW91bnQgc3RhdHVzCiAgLS1zZWxmdGVzdCAgICAgICAgICAgICAgdmVyaWZ5IGVt"
+    "YmVkZGVkIGNvbmZpZyBkZWNyeXB0cyAobm8gc2VjcmV0cyBwcmludGVkKSIiIikKCgpkZWYgbWFpbigpOgogICAgbW9kZSA9"
+    "IHN5cy5hcmd2WzFdIGlmIGxlbihzeXMuYXJndikgPiAxIGVsc2UgIi0tb25lc2hvdCIKICAgIGlmIG1vZGUgaW4gKCItLW9u"
+    "ZXNob3QiLCAiIik6CiAgICAgICAgc3lzLmV4aXQob25lc2hvdCgpKQogICAgZWxpZiBtb2RlID09ICItLWluc3RhbGwtc2Vy"
+    "dmljZSI6CiAgICAgICAgc3lzLmV4aXQoaW5zdGFsbF9zZXJ2aWNlKCkpCiAgICBlbGlmIG1vZGUgPT0gIi0tdW5pbnN0YWxs"
+    "IjoKICAgICAgICBzeXMuZXhpdCh1bmluc3RhbGwoKSkKICAgIGVsaWYgbW9kZSA9PSAiLS1zdGF0dXMiOgogICAgICAgIHN5"
+    "cy5leGl0KHN0YXR1cygpKQogICAgZWxpZiBtb2RlID09ICItLXNlbGZ0ZXN0IjoKICAgICAgICBzeXMuZXhpdChzZWxmdGVz"
+    "dCgpKQogICAgZWxpZiBtb2RlIGluICgiLWgiLCAiLS1oZWxwIiwgImhlbHAiKToKICAgICAgICB1c2FnZSgpCiAgICBlbHNl"
+    "OgogICAgICAgIHVzYWdlKCkKICAgICAgICBzeXMuZXhpdCgyKQoKCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6CiAgICBt"
+    "YWluKCkK"
 )
 
 def py_client_template() -> str:
-    return base64.b64decode("".join(PY_CLIENT_TEMPLATE_B64)).decode()
+    src = base64.b64decode("".join(PY_CLIENT_TEMPLATE_B64)).decode()
+    marker = "# __FINGERPRINT_LOGIC__"
+    assert marker in src, "client template missing fingerprint-logic splice marker"
+    return src.replace(marker, FINGERPRINT_LOGIC_SRC)
 
 # ------------------------------------------------------------------ collect
+FP_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+def prompt_binding() -> dict:
+    print(
+        "\nMachine binding: without it, anyone who obtains the generated "
+        "script can decrypt it. With it, the script only decrypts on "
+        "machines whose fingerprint you list below (collect one first with "
+        "--emit-collector on each target machine).\n"
+    )
+    mode = ""
+    while mode not in ("machine", "none"):
+        mode = (input("Binding mode [machine/none]: ").strip().lower())
+    if mode == "none":
+        return {"mode": "none", "fingerprints": []}
+    print("Paste one 64-hex-char fingerprint per line. Empty line finishes.")
+    fps = []
+    while True:
+        line = input(f"  fingerprint [{len(fps)+1}]: ").strip()
+        if not line:
+            break
+        fps.append(line)
+    if not fps:
+        sys.exit("binding.mode=machine requires at least one fingerprint")
+    return {"mode": "machine", "fingerprints": fps}
+
 def prompt_config() -> dict:
     print("=== nas-enp-mount configuration ===\n")
     protocol = ""
@@ -245,13 +422,14 @@ def prompt_config() -> dict:
     retry_attempts = int(input("Retry attempts on failure (default 5): ").strip() or "5")
     retry_delay = int(input("Base retry delay seconds (default 5): ").strip() or "5")
     install_deps = (input("Auto-install cifs-utils if missing? [Y/n]: ").strip().lower() or "y") == "y"
+    binding = prompt_binding()
 
     return {
         "protocol": protocol, "host": host, "username": username,
         "password": password, "domain": domain,
         "default_options": default_options, "mounts": mounts,
         "retry_attempts": retry_attempts, "retry_delay_sec": retry_delay,
-        "install_deps": install_deps,
+        "install_deps": install_deps, "binding": binding,
     }
 
 def validate(cfg: dict):
@@ -272,9 +450,42 @@ def validate(cfg: dict):
     cfg.setdefault("retry_delay_sec", 5)
     cfg.setdefault("install_deps", True)
     cfg.setdefault("password", "")
+    validate_binding(cfg)
+
+def validate_binding(cfg: dict):
+    binding = cfg.get("binding")
+    if not isinstance(binding, dict) or "mode" not in binding:
+        sys.exit(
+            "binding.mode is required (no default). Choose one:\n"
+            '  {"binding": {"mode": "machine", "fingerprints": ["<64 hex>", ...]}}\n'
+            '    -> decrypts only on the listed machines (see --emit-collector)\n'
+            '  {"binding": {"mode": "none"}}\n'
+            '    -> compatibility mode, NO leak protection'
+        )
+    mode = binding.get("mode")
+    if mode not in ("machine", "none"):
+        sys.exit('binding.mode must be "machine" or "none"')
+    fps = binding.get("fingerprints") or []
+    if mode == "none":
+        binding["fingerprints"] = []
+        return
+    if not fps:
+        sys.exit("binding.mode=machine requires a non-empty binding.fingerprints list")
+    seen = set()
+    deduped = []
+    for fp in fps:
+        fp_norm = str(fp).strip().lower()
+        if not FP_HEX_RE.match(fp_norm):
+            sys.exit(f"invalid fingerprint (must be 64 hex chars): {fp!r}")
+        if fp_norm in seen:
+            print(f"[warn] duplicate fingerprint dropped: {fp_norm[:8]}...", file=sys.stderr)
+            continue
+        seen.add(fp_norm)
+        deduped.append(fp_norm)
+    binding["fingerprints"] = deduped
 
 # ------------------------------------------------------------------ crypto
-def encrypt_config(cfg: dict) -> dict:
+def encrypt_config_legacy(cfg: dict) -> dict:
     plain = json.dumps(cfg, separators=(",", ":")).encode()
     key = os.urandom(32)
     pad = os.urandom(32)
@@ -284,12 +495,124 @@ def encrypt_config(cfg: dict) -> dict:
     b = lambda x: base64.b64encode(x).decode()
     return {"cipher": b(ct), "nonce": b(nonce), "keya": b(key_a), "keypad": b(pad)}
 
-def fill_template(blob: dict) -> str:
-    return (py_client_template()
-            .replace("__CIPHERTEXT__", blob["cipher"])
-            .replace("__NONCE__", blob["nonce"])
-            .replace("__KEYA__", blob["keya"])
-            .replace("__KEYPAD__", blob["keypad"]))
+def build_envelope(cfg: dict, fingerprints: list) -> dict:
+    """Multi-recipient envelope: one random DEK encrypts the config once;
+    each fingerprint wraps that same DEK via its own Scrypt-derived KEK.
+    See DESIGN.md 'Envelope format'."""
+    dek = os.urandom(32)
+    payload_nonce = os.urandom(12)
+    plain = json.dumps(cfg, separators=(",", ":")).encode()
+    payload_ct = AESGCM(dek).encrypt(payload_nonce, plain, b"nas-enp/payload/v2")
+
+    b = lambda x: base64.b64encode(x).decode()
+    slots = []
+    for fp in fingerprints:
+        selector = fingerprint_selector(fp)
+        salt = os.urandom(16)
+        kek = Scrypt(salt=salt, length=32, n=2**15, r=8, p=1).derive(fp.encode())
+        slot_nonce = os.urandom(12)
+        wrapped_dek = AESGCM(kek).encrypt(slot_nonce, dek, b"nas-enp/slot/v2")
+        slots.append({
+            "selector": selector, "salt": b(salt),
+            "nonce": b(slot_nonce), "wrapped_dek": b(wrapped_dek),
+        })
+    random.shuffle(slots)  # slot position must not leak generation order
+
+    return {
+        "v": 2,
+        "kdf": {"algo": "scrypt", "n": 32768, "r": 8, "p": 1, "dklen": 32},
+        "slots": slots,
+        "payload": {"nonce": b(payload_nonce), "ct": b(payload_ct)},
+    }
+
+def fingerprint_selector(fingerprint: str) -> str:
+    return hashlib.sha256((fingerprint + "nas-enp/selector/v2").encode()).digest()[:8].hex()
+
+def fill_template(cfg: dict) -> str:
+    """Fill the client template per cfg['binding']['mode'] and return the
+    finished source. Both blob placeholder sets are always present in the
+    template; the unused set is filled with harmless empty strings."""
+    binding = cfg["binding"]
+    src = py_client_template()
+    if binding["mode"] == "machine":
+        envelope = build_envelope(cfg, binding["fingerprints"])
+        env_b64 = base64.b64encode(json.dumps(envelope).encode()).decode()
+        return (src.replace("__CONFIG_MODE__", "envelope")
+                   .replace("__CIPHERTEXT__", "")
+                   .replace("__NONCE__", "")
+                   .replace("__KEYA__", "")
+                   .replace("__KEYPAD__", "")
+                   .replace("__ENVELOPE__", env_b64))
+    blob = encrypt_config_legacy(cfg)
+    return (src.replace("__CONFIG_MODE__", "legacy")
+               .replace("__CIPHERTEXT__", blob["cipher"])
+               .replace("__NONCE__", blob["nonce"])
+               .replace("__KEYA__", blob["keya"])
+               .replace("__KEYPAD__", blob["keypad"])
+               .replace("__ENVELOPE__", ""))
+
+def self_check_no_leak(src: str, cfg: dict, out_path: str):
+    """Post-generation guardrail (guide 6.4): scan the written file for
+    plaintext or base64 leaks of host/username/password. Abort + delete
+    the output on any hit rather than ship a broken generator silently."""
+    needles = []
+    for field in ("host", "username", "password"):
+        val = cfg.get(field)
+        if val:
+            needles.append(str(val))
+            needles.append(base64.b64encode(str(val).encode()).decode())
+    hits = [n for n in needles if n and n in src]
+    if hits:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        sys.exit(
+            f"FATAL: generation self-check found {len(hits)} plaintext/base64 "
+            f"leak(s) in the written client script. Output deleted: {out_path}\n"
+            "This means the generator itself has a bug — do not ignore this."
+        )
+
+COLLECTOR_HEADER = '''\
+#!/usr/bin/env python3
+"""
+nas-enp-fingerprint — standalone hardware fingerprint collector
+
+Run as root on the TARGET machine before generating a machine-bound
+nas-enp-mount client. Prints a 64-hex-char fingerprint; paste it into
+nas-enp-gen's "binding.fingerprints" list (or the GUI's fingerprint box).
+
+Zero third-party dependencies — copy this single file anywhere and run it
+with any Python 3. Contains no credentials and no NAS information.
+"""
+import hashlib
+import os
+import re
+
+'''
+
+COLLECTOR_MAIN = '''
+
+def main():
+    fingerprint, used, skipped = collect_fingerprint()
+    print(f"fingerprint: {fingerprint}")
+    print(f"components used: {', '.join(used)}")
+    if skipped:
+        print(f"components skipped: {', '.join(skipped)}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+def emit_collector(out_path: str):
+    src = COLLECTOR_HEADER + FINGERPRINT_LOGIC_SRC + COLLECTOR_MAIN
+    out_abs = os.path.abspath(out_path)
+    with open(out_abs, "w", newline="\n") as f:
+        f.write(src)
+    os.chmod(out_abs, 0o755)
+    print(f"[emit] Fingerprint collector written to: {out_abs}")
+    print(f"Copy it to each target machine and run (as root): python3 {os.path.basename(out_abs)}")
 
 def deploy_instructions(out_path: str, lang: str = "en") -> str:
     name = os.path.basename(out_path)
@@ -339,6 +662,14 @@ STRINGS = {
         "done_title": "Done",
         "close": "Close",
         "script_written": "Client script written to: {path}\n\n",
+        "binding_label": "Machine binding:",
+        "binding_machine": "Bind to specific machine(s)",
+        "binding_none": "No binding (compatibility mode)",
+        "binding_fingerprints_placeholder": "one 64-hex fingerprint per line (see Export collector)",
+        "binding_import_file": "Import from file",
+        "binding_count": "{n} machine(s) loaded",
+        "export_collector": "Export collector",
+        "export_collector_saved": "Fingerprint collector written to: {path}",
     },
     "zh": {
         "window_title": "nas-enp-mount 生成器",
@@ -366,6 +697,14 @@ STRINGS = {
         "done_title": "完成",
         "close": "关闭",
         "script_written": "客户端脚本已写入：{path}\n\n",
+        "binding_label": "机器绑定：",
+        "binding_machine": "绑定到指定机器",
+        "binding_none": "不绑定（兼容模式）",
+        "binding_fingerprints_placeholder": "每行一个 64 位十六进制指纹（见“导出采集器”）",
+        "binding_import_file": "从文件导入",
+        "binding_count": "已载入 {n} 台机器的指纹",
+        "export_collector": "导出采集器",
+        "export_collector_saved": "采集器已写入：{path}",
     },
 }
 
@@ -377,6 +716,7 @@ VALIDATE_MSG_ZH = {
     "host is required": "必须填写主机地址",
     "cifs requires a username": "CIFS 协议需要用户名",
     "at least one mount is required": "至少需要一个挂载项",
+    "binding.mode=machine requires a non-empty binding.fingerprints list": "选择“绑定到指定机器”时至少需要一个指纹",
 }
 
 def translate_validation_msg(msg: str, lang: str) -> str:
@@ -419,7 +759,7 @@ def launch_gui():
     from PySide6.QtWidgets import (
         QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit,
         QComboBox, QCheckBox, QSpinBox, QPushButton, QLabel, QMessageBox,
-        QPlainTextEdit, QDialog,
+        QPlainTextEdit, QDialog, QFileDialog,
     )
     from PySide6.QtCore import QLocale
 
@@ -523,12 +863,38 @@ def launch_gui():
 
             root.addLayout(self.form2)
 
+            self.binding_label = QLabel()
+            root.addWidget(self.binding_label)
+            self.binding_combo = QComboBox()
+            self.binding_combo.addItem("", "machine")
+            self.binding_combo.addItem("", "none")
+            self.binding_combo.currentIndexChanged.connect(self._on_binding_mode_changed)
+            root.addWidget(self.binding_combo)
+
+            self.fingerprints_box = QPlainTextEdit()
+            self.fingerprints_box.textChanged.connect(self._on_fingerprints_changed)
+            root.addWidget(self.fingerprints_box)
+
+            binding_btn_row = QHBoxLayout()
+            self.import_fp_btn = QPushButton()
+            self.import_fp_btn.clicked.connect(self._on_import_fingerprints)
+            binding_btn_row.addWidget(self.import_fp_btn)
+            self.export_collector_btn = QPushButton()
+            self.export_collector_btn.clicked.connect(self._on_export_collector)
+            binding_btn_row.addWidget(self.export_collector_btn)
+            binding_btn_row.addStretch()
+            root.addLayout(binding_btn_row)
+
+            self.fingerprint_count_label = QLabel()
+            root.addWidget(self.fingerprint_count_label)
+
             self.gen_btn = QPushButton()
             self.gen_btn.clicked.connect(self._on_generate)
             root.addWidget(self.gen_btn)
 
             self._on_protocol_changed(self.protocol.currentText())
             self._add_mount_row()
+            self._on_binding_mode_changed()
             self.retranslate()
 
         def _strings(self):
@@ -559,6 +925,13 @@ def launch_gui():
             self.gen_btn.setText(s["generate"])
             for row in self.mount_rows:
                 row.retranslate(s)
+            self.binding_label.setText(s["binding_label"])
+            self.binding_combo.setItemText(0, s["binding_machine"])
+            self.binding_combo.setItemText(1, s["binding_none"])
+            self.fingerprints_box.setPlaceholderText(s["binding_fingerprints_placeholder"])
+            self.import_fp_btn.setText(s["binding_import_file"])
+            self.export_collector_btn.setText(s["export_collector"])
+            self._update_fingerprint_count_label()
 
         def _on_protocol_changed(self, protocol):
             if protocol == "cifs":
@@ -579,9 +952,45 @@ def launch_gui():
             row.setParent(None)
             row.deleteLater()
 
+        def _on_binding_mode_changed(self):
+            is_machine = self.binding_combo.currentData() == "machine"
+            self.fingerprints_box.setVisible(is_machine)
+            self.import_fp_btn.setVisible(is_machine)
+            self.fingerprint_count_label.setVisible(is_machine)
+
+        def _parsed_fingerprints(self):
+            return [line.strip() for line in self.fingerprints_box.toPlainText().splitlines() if line.strip()]
+
+        def _update_fingerprint_count_label(self):
+            s = self._strings()
+            self.fingerprint_count_label.setText(s["binding_count"].format(n=len(self._parsed_fingerprints())))
+
+        def _on_fingerprints_changed(self):
+            self._update_fingerprint_count_label()
+
+        def _on_import_fingerprints(self):
+            path, _ = QFileDialog.getOpenFileName(self, self._strings()["binding_import_file"])
+            if not path:
+                return
+            with open(path) as f:
+                lines = [line.strip() for line in f if line.strip()]
+            existing = self.fingerprints_box.toPlainText()
+            combined = (existing + "\n" if existing.strip() else "") + "\n".join(lines)
+            self.fingerprints_box.setPlainText(combined)
+
+        def _on_export_collector(self):
+            s = self._strings()
+            path, _ = QFileDialog.getSaveFileName(self, s["export_collector"], "nas-enp-fingerprint.py")
+            if not path:
+                return
+            emit_collector(path)
+            QMessageBox.information(self, s["done_title"], s["export_collector_saved"].format(path=os.path.abspath(path)))
+
         def _collect_config(self):
             mounts = [r.to_dict() for r in self.mount_rows]
             mounts = [m for m in mounts if m["remote"] and m["local"]]
+            mode = self.binding_combo.currentData()
+            binding = {"mode": mode, "fingerprints": self._parsed_fingerprints() if mode == "machine" else []}
             return {
                 "protocol": self.protocol.currentText(),
                 "host": self.host.text().strip(),
@@ -593,6 +1002,7 @@ def launch_gui():
                 "retry_attempts": self.retry_attempts.value(),
                 "retry_delay_sec": self.retry_delay.value(),
                 "install_deps": self.install_deps.isChecked(),
+                "binding": binding,
             }
 
         def _on_generate(self):
@@ -612,12 +1022,16 @@ def launch_gui():
                     json.dump(cfg, f, indent=2)
                 os.chmod(save_path, 0o600)
 
-            blob = encrypt_config(cfg)
-            src = fill_template(blob)
+            src = fill_template(cfg)
             out_abs = os.path.abspath(out_path)
             with open(out_abs, "w", newline="\n") as f:
                 f.write(src)
             os.chmod(out_abs, 0o700)
+            try:
+                self_check_no_leak(src, cfg, out_abs)
+            except SystemExit as e:
+                QMessageBox.critical(self, s["invalid_config_title"], str(e))
+                return
 
             dlg = QDialog(self)
             dlg.setWindowTitle(s["done_title"])
@@ -645,7 +1059,13 @@ def main():
     ap.add_argument("--cli", action="store_true", help="use terminal prompts instead of the GUI")
     ap.add_argument("--out", default="nas-enp-mount.py", help="output client script path")
     ap.add_argument("--save-config", help="write the collected config to this JSON file (contains the PASSWORD in cleartext, guard it)")
+    ap.add_argument("--emit-collector", action="store_true",
+                     help="write a standalone fingerprint-collection script for a target machine and exit")
     args = ap.parse_args()
+
+    if args.emit_collector:
+        emit_collector(args.out if args.out != "nas-enp-mount.py" else "nas-enp-fingerprint.py")
+        return
 
     if args.config:
         with open(args.config) as f:
@@ -664,12 +1084,12 @@ def main():
         os.chmod(args.save_config, 0o600)
         print(f"[note] config saved to {args.save_config} (0600). It holds the cleartext password.")
 
-    blob = encrypt_config(cfg)
-    src = fill_template(blob)
+    src = fill_template(cfg)
     out_abs = os.path.abspath(args.out)
     with open(out_abs, "w", newline="\n") as f:
         f.write(src)
     os.chmod(out_abs, 0o700)
+    self_check_no_leak(src, cfg, out_abs)
 
     print(f"\n[emit] Client script written to: {out_abs}")
     print(deploy_instructions(out_abs))

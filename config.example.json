@@ -10,5 +10,12 @@
   ],
   "retry_attempts": 5,
   "retry_delay_sec": 5,
-  "install_deps": true
+  "install_deps": true,
+  "binding": {
+    "mode": "machine",
+    "fingerprints": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ]
+  }
 }

@@ -8,17 +8,23 @@ A two-part tool for auto-mounting NAS shares on Linux clients without leaving th
 
 - **`nas-enp-gen.py`** (the *generator*, runs on your workstation) — takes NAS connection details and mount mappings, AES-256-GCM encrypts them, and writes a self-contained Python client script that embeds the ciphertext. Run it with no arguments for a **GUI form** (PySide6, switchable **English / 中文** via the language dropdown in the top-left corner — defaults to your system locale), or `--config`/`--cli` for headless/scripted use. Also shipped as installable **`.deb`** (Linux) and **`.exe`** (Windows) desktop apps — see Install.
 - **The generated script** (the *client*) — drop it on each Linux box (Debian/Ubuntu), run as root with `python3`; it mounts the configured shares and can install itself as a systemd boot service.
+- **Machine binding (optional but recommended)** — `binding.mode: "machine"` derives the client's decryption key from each target machine's own hardware fingerprint instead of embedding a recoverable key. A generated file that leaks off its bound machine(s) — group chat, backup, retired hardware, accidental public commit — is computationally useless. See "Honest security note" below for exactly what this does and doesn't protect against.
 
 Non-goals: this does not make credentials unrecoverable on a client that has root access — see the security note below. It is not a general-purpose secrets manager.
 
 ## Honest security note (read this)
 
-The goal "the credentials can't be reverse-engineered on the client" **cannot be fully achieved** — any client able to mount the share must present the credentials, so a root user on that client can always recover them (RAM dump, `strace` on the mount, packet capture of the SMB auth). What this tool actually does:
+The goal "the credentials can't be reverse-engineered on the client" **cannot be fully achieved** — any client able to mount the share must present the credentials, so a root user on that client can always recover them (RAM dump, `strace` on the mount, packet capture of the SMB auth). This is true regardless of `binding.mode`. What this tool actually does, split by mode:
 
-- Credentials are **AES-256-GCM encrypted** and embedded in the client script; the key is split/XOR-obfuscated. No plaintext config file is ever written to the client disk.
-- That's **obfuscation, not unbreakable secrecy** — it stops casual inspection and accidental leakage, and raises the bar for a determined attacker. Since the client is a plain, readable `.py` file rather than a compiled binary, that bar is a bit lower than a stripped executable would be — see `DECISIONS.md`.
+**`binding.mode: "machine"` (recommended) — real protection against the file leaking:**
+- The client's actual decryption key is never stored anywhere. It's derived at runtime from a Scrypt hash of the machine's own hardware fingerprint (`product_uuid` + other DMI/disk identifiers — see `DESIGN.md` "Envelope format"). A copy of the script on any other machine has no way to reach that key — not "hard to find", structurally absent.
+- Still true on a **bound** machine: root there can recover everything, the same as any mode (RAM dump, `strace`, packet capture). Binding raises the bar for *exfiltration*, not for a local root attacker.
 
-**Do this too:** create a **dedicated, least-privilege (read-only where possible), revocable** account on the NAS for these clients. If it ever leaks, the damage is contained and you kill it by changing one password on the NAS.
+**`binding.mode: "none"` (compatibility mode) — obfuscation only:**
+- Credentials are AES-256-GCM encrypted with a key split/XOR-obfuscated in the same file. No plaintext config file is ever written to the client disk.
+- That's **obfuscation, not unbreakable secrecy** — it stops casual inspection and accidental leakage, but the key is recoverable by anyone who obtains the script, on any machine. Use this only when fingerprints can't be pre-collected for a target.
+
+**Do this too, regardless of mode:** create a **dedicated, least-privilege (read-only where possible), revocable** account on the NAS for these clients. If it ever leaks, the damage is contained and you kill it by changing one password on the NAS.
 
 ## Requirements
 
@@ -51,6 +57,22 @@ pyinstaller packaging/nas-enp-gen.spec
 Output: `dist/nas-enp-gen` (Linux) or `dist/nas-enp-gen.exe` (Windows). On Linux, wrap it into a `.deb` with `packaging/build-deb.sh`.
 
 **Windows gotcha:** run `pyinstaller`, not `python pyinstaller` — it's a standalone console command installed by `pip`, not a script you pass to `python`. If `pyinstaller` isn't found on `PATH` (common with the Microsoft Store Python alias, whose `Scripts` folder often isn't on `PATH`), use `python -m PyInstaller packaging\nas-enp-gen.spec` instead — that always works regardless of `PATH`.
+
+## Step 0: collect fingerprints from target machines (`binding.mode: "machine"` only)
+
+Skip this if you're using `binding.mode: "none"`. Otherwise, on **each** target
+machine (as root):
+
+```bash
+python3 nas-enp-gen.py --emit-collector          # writes nas-enp-fingerprint.py
+# copy nas-enp-fingerprint.py to the target machine, then on that machine:
+python3 nas-enp-fingerprint.py
+```
+
+It prints a 64-hex-char fingerprint and which hardware fields it used —
+paste that fingerprint into `config.json`'s `binding.fingerprints` array (or
+the GUI's fingerprint box). One file with N fingerprints can bind an entire
+fleet — see `DESIGN.md` "Envelope format".
 
 ## Quick start
 
@@ -111,9 +133,33 @@ Check logs any time with: `journalctl -u nas-enp-mount.service`
 
 The credentials live only inside the script. When the NAS IP or password changes, re-run the generator to produce a new script and copy it over (`--uninstall` first if you want a clean swap). There is no editable config on the client to get out of sync.
 
+## What if the hardware changes? (`binding.mode: "machine"` only)
+
+The fingerprint is one hash over *all* valid hardware components combined
+(strict mode, by design — see `DECISIONS.md`). A disk swap, a BIOS/DMI
+field change from a firmware update, or similar hardware maintenance on a
+bound machine will change its fingerprint, and the existing client will
+start failing with:
+
+```
+fingerprint mismatch: this client was not generated for this machine
+(or the hardware changed). Regenerate it with nas-enp-gen using this
+machine's current fingerprint. Run --selftest for details.
+```
+
+This is a fail-closed design choice, not a bug — see `DECISIONS.md` "Strict
+mode, not fault-tolerant, for hardware changes". Recovery: re-run
+`--emit-collector` on the changed machine, get its new fingerprint, and
+regenerate the client with that fingerprint in `binding.fingerprints`.
+`--selftest` on the failing client will show which components it collected
+and confirm the slot lookup failed, before you regenerate anything.
+
 ## Configuration
 
-See `config.example.json` for the full shape. Full reference: see `DESIGN.md` → Configuration reference.
+See `config.example.json` for the full shape, including the `binding`
+field (`{"mode": "machine", "fingerprints": [...]}` or `{"mode": "none"}` —
+required, no default, see "Honest security note" above). Full reference:
+see `DESIGN.md` → Configuration reference.
 
 ## License
 
