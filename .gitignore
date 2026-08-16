@@ -30,14 +30,15 @@ __pycache__/
 venv/
 target/
 
-# Build output — the generated Go client (binary and/or source) and any
-# Go build cache, since these are produced by nas-enp-gen.py, not source.
+# Build output — the generated client script and any PyInstaller/packaging
+# artifacts, since these are produced by nas-enp-gen.py / packaging/, not source.
 dist/
 build/
 *.egg-info/
-nas-enp-mount
+nas-enp-mount.py
 nas-enp-mount-*
-*.go
+*.deb
+*.exe
 
 # OS / editor
 .DS_Store

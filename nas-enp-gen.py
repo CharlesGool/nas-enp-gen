@@ -1,176 +1,189 @@
 #!/usr/bin/env python3
 """
 nas-enp-mount generator (server side)
-Runs on YOUR computer. Collects NAS connection details + mount mappings,
-encrypts them (AES-256-GCM), embeds the ciphertext into a Go client, and
-compiles a single stripped static Linux binary.
+Collects NAS connection details + mount mappings, encrypts them
+(AES-256-GCM), and fills them into a plain Python client script.
 
-The generated binary decrypts the config only in memory at run time; the
-plaintext IP / account / password never sit on the client's disk, and
-`strings` on the binary reveals nothing.
+The generated script decrypts the config only in memory at run time; the
+plaintext IP / account / password never sit on the client's disk as a
+separate file, and grepping the script only reveals base64 ciphertext.
 
 SECURITY REALITY CHECK
 ----------------------
 This is obfuscation, not unbreakable secrecy. A client that can mount the
 share must be able to produce the credentials, so anyone with root on that
 client can still recover them (RAM dump, strace, packet capture). Treat the
-binary as "raises the bar a lot", and pair it with a DEDICATED, LEAST-
+script as "raises the bar a bit", and pair it with a DEDICATED, LEAST-
 PRIVILEGE, REVOCABLE NAS account so a leak is small and you can kill it by
 changing one password on the NAS.
 
 Requirements on this machine:
   - Python 3.8+  with the `cryptography` package  (pip install cryptography)
-  - Go toolchain (https://go.dev/dl/) to compile. Cross-compiles to any arch.
-    Without Go, use --no-build to emit source and compile on any Linux box.
+  - PySide6, for the GUI (auto-installed via pip on first GUI launch;
+    not needed for --config/--cli headless use)
+
+Requirements on each client machine (Debian/Ubuntu Linux, root):
+  - Python 3.8+  with the `cryptography` package (auto-installed via pip
+    by the client script itself on first run if missing)
 
 Usage:
-  python3 nas-enp-gen.py                      # interactive
-  python3 nas-enp-gen.py --config nas.json    # from a JSON file
-  python3 nas-enp-gen.py --config nas.json --arch amd64,arm64
-  python3 nas-enp-gen.py --config nas.json --no-build   # emit Go source only
+  python3 nas-enp-gen.py                       # launch the GUI
+  python3 nas-enp-gen.py --cli                  # interactive terminal prompts
+  python3 nas-enp-gen.py --config nas.json      # from a JSON file, headless
+  python3 nas-enp-gen.py --config nas.json --out nas-enp-mount.py
 """
-import argparse, base64, getpass, json, os, shutil, subprocess, sys, tempfile
+import argparse, base64, getpass, json, os, subprocess, sys
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 except ImportError:
     sys.exit("Missing dependency. Run:  pip install cryptography")
 
-# ---- Embedded Go client template (base64) ----
-GO_TEMPLATE_B64 = (
-    "cGFja2FnZSBtYWluCgovLyBuYXMtZW5wLW1vdW50IGNsaWVudAovLyBCdWlsdCBmcm9tIGFuIGVuY3J5cHRlZCBjb25maWcgYmxv"
-    "YiBlbWJlZGRlZCBhdCBnZW5lcmF0aW9uIHRpbWUuCi8vIFRoZSBwbGFpbnRleHQgY29uZmlnIG5ldmVyIHRvdWNoZXMgZGlzayBv"
-    "biB0aGUgY2xpZW50LgoKaW1wb3J0ICgKCSJjcnlwdG8vYWVzIgoJImNyeXB0by9jaXBoZXIiCgkiZW5jb2RpbmcvYmFzZTY0IgoJ"
-    "ImVuY29kaW5nL2pzb24iCgkiZm10IgoJIm9zIgoJIm9zL2V4ZWMiCgkicGF0aC9maWxlcGF0aCIKCSJzdHJpbmdzIgoJInRpbWUi"
-    "CikKCi8vIC0tLS0gRW1iZWRkZWQgYmxvYiAoZmlsbGVkIGluIGJ5IHRoZSBnZW5lcmF0b3IpIC0tLS0KdmFyICgKCWJsb2JDaXBo"
-    "ZXIgPSAiX19DSVBIRVJURVhUX18iCglibG9iTm9uY2UgID0gIl9fTk9OQ0VfXyIKCWJsb2JLZXlBICAgPSAiX19LRVlBX18iCgli"
-    "bG9iS2V5UGFkID0gIl9fS0VZUEFEX18iCikKCmNvbnN0IGluc3RhbGxEaXIgPSAiL3Jvb3QvbmFzLWVucC1tb3VudCIKY29uc3Qg"
-    "YmluTmFtZSA9ICJuYXMtZW5wLW1vdW50Igpjb25zdCBzZXJ2aWNlTmFtZSA9ICJuYXMtZW5wLW1vdW50LnNlcnZpY2UiCgp0eXBl"
-    "IE1vdW50U3BlYyBzdHJ1Y3QgewoJUmVtb3RlICBzdHJpbmcgYGpzb246InJlbW90ZSJgCglMb2NhbCAgIHN0cmluZyBganNvbjoi"
-    "bG9jYWwiYAoJT3B0aW9ucyBzdHJpbmcgYGpzb246Im9wdGlvbnMiYAp9Cgp0eXBlIENvbmZpZyBzdHJ1Y3QgewoJUHJvdG9jb2wg"
-    "ICAgICAgc3RyaW5nICAgICAgYGpzb246InByb3RvY29sImAgLy8gImNpZnMiIG9yICJuZnMiCglIb3N0ICAgICAgICAgICBzdHJp"
-    "bmcgICAgICBganNvbjoiaG9zdCJgCglVc2VybmFtZSAgICAgICBzdHJpbmcgICAgICBganNvbjoidXNlcm5hbWUiYAoJUGFzc3dv"
-    "cmQgICAgICAgc3RyaW5nICAgICAgYGpzb246InBhc3N3b3JkImAKCURvbWFpbiAgICAgICAgIHN0cmluZyAgICAgIGBqc29uOiJk"
-    "b21haW4iYAoJRGVmYXVsdE9wdGlvbnMgc3RyaW5nICAgICAgYGpzb246ImRlZmF1bHRfb3B0aW9ucyJgCglNb3VudHMgICAgICAg"
-    "ICBbXU1vdW50U3BlYyBganNvbjoibW91bnRzImAKCVJldHJ5QXR0ZW1wdHMgIGludCAgICAgICAgIGBqc29uOiJyZXRyeV9hdHRl"
-    "bXB0cyJgCglSZXRyeURlbGF5U2VjICBpbnQgICAgICAgICBganNvbjoicmV0cnlfZGVsYXlfc2VjImAKCUluc3RhbGxEZXBzICAg"
-    "IGJvb2wgICAgICAgIGBqc29uOiJpbnN0YWxsX2RlcHMiYAp9CgpmdW5jIGxvZ2YoZm9ybWF0IHN0cmluZywgYSAuLi5pbnRlcmZh"
-    "Y2V7fSkgewoJZm10LkZwcmludGYob3MuU3RkZXJyLCAiW25hcy1lbnAtbW91bnRdICIrZm9ybWF0KyJcbiIsIGEuLi4pCn0KCmZ1"
-    "bmMgZGVjb2RlQjY0KHMgc3RyaW5nKSBbXWJ5dGUgewoJYiwgZXJyIDo9IGJhc2U2NC5TdGRFbmNvZGluZy5EZWNvZGVTdHJpbmco"
-    "cykKCWlmIGVyciAhPSBuaWwgewoJCWxvZ2YoImZhdGFsOiBibG9iIGRlY29kZSBlcnJvcjogJXYiLCBlcnIpCgkJb3MuRXhpdCgy"
-    "KQoJfQoJcmV0dXJuIGIKfQoKZnVuYyBsb2FkQ29uZmlnKCkgKCpDb25maWcsIGVycm9yKSB7CglrZXlBIDo9IGRlY29kZUI2NChi"
-    "bG9iS2V5QSkKCWtleVBhZCA6PSBkZWNvZGVCNjQoYmxvYktleVBhZCkKCWlmIGxlbihrZXlBKSAhPSBsZW4oa2V5UGFkKSB7CgkJ"
-    "cmV0dXJuIG5pbCwgZm10LkVycm9yZigia2V5IG1hdGVyaWFsIGxlbmd0aCBtaXNtYXRjaCIpCgl9CglrZXkgOj0gbWFrZShbXWJ5"
-    "dGUsIGxlbihrZXlBKSkKCWZvciBpIDo9IHJhbmdlIGtleUEgewoJCWtleVtpXSA9IGtleUFbaV0gXiBrZXlQYWRbaV0KCX0KCWJs"
-    "b2NrLCBlcnIgOj0gYWVzLk5ld0NpcGhlcihrZXkpCglpZiBlcnIgIT0gbmlsIHsKCQlyZXR1cm4gbmlsLCBlcnIKCX0KCWdjbSwg"
-    "ZXJyIDo9IGNpcGhlci5OZXdHQ00oYmxvY2spCglpZiBlcnIgIT0gbmlsIHsKCQlyZXR1cm4gbmlsLCBlcnIKCX0KCXBsYWluLCBl"
-    "cnIgOj0gZ2NtLk9wZW4obmlsLCBkZWNvZGVCNjQoYmxvYk5vbmNlKSwgZGVjb2RlQjY0KGJsb2JDaXBoZXIpLCBuaWwpCglpZiBl"
-    "cnIgIT0gbmlsIHsKCQlyZXR1cm4gbmlsLCBmbXQuRXJyb3JmKCJjb25maWcgYXV0aC9kZWNyeXB0IGZhaWxlZDogJXciLCBlcnIp"
-    "Cgl9Cgl2YXIgYyBDb25maWcKCWlmIGVyciA6PSBqc29uLlVubWFyc2hhbChwbGFpbiwgJmMpOyBlcnIgIT0gbmlsIHsKCQlyZXR1"
-    "cm4gbmlsLCBlcnIKCX0KCS8vIHplcm8gdGhlIGtleQoJZm9yIGkgOj0gcmFuZ2Uga2V5IHsKCQlrZXlbaV0gPSAwCgl9CglyZXR1"
-    "cm4gJmMsIG5pbAp9CgpmdW5jIHJlcXVpcmVSb290KCkgewoJaWYgb3MuR2V0ZXVpZCgpICE9IDAgewoJCWxvZ2YoImZhdGFsOiBt"
-    "dXN0IGJlIHJ1biBhcyByb290IikKCQlvcy5FeGl0KDEpCgl9Cn0KCmZ1bmMgaXNNb3VudGVkKHRhcmdldCBzdHJpbmcpIGJvb2wg"
-    "ewoJZGF0YSwgZXJyIDo9IG9zLlJlYWRGaWxlKCIvcHJvYy9tb3VudHMiKQoJaWYgZXJyICE9IG5pbCB7CgkJcmV0dXJuIGZhbHNl"
-    "Cgl9CglhYnMsIF8gOj0gZmlsZXBhdGguQWJzKHRhcmdldCkKCWZvciBfLCBsaW5lIDo9IHJhbmdlIHN0cmluZ3MuU3BsaXQoc3Ry"
-    "aW5nKGRhdGEpLCAiXG4iKSB7CgkJZmllbGRzIDo9IHN0cmluZ3MuRmllbGRzKGxpbmUpCgkJaWYgbGVuKGZpZWxkcykgPj0gMiB7"
-    "CgkJCS8vIC9wcm9jL21vdW50cyBlc2NhcGVzIHNwYWNlcyBhcyBcMDQwOyBnb29kIGVub3VnaCBmb3IgdHlwaWNhbCBwYXRocwoJ"
-    "CQlpZiBmaWVsZHNbMV0gPT0gYWJzIHx8IGZpZWxkc1sxXSA9PSB0YXJnZXQgewoJCQkJcmV0dXJuIHRydWUKCQkJfQoJCX0KCX0K"
-    "CXJldHVybiBmYWxzZQp9CgpmdW5jIGhhdmVDbWQobmFtZSBzdHJpbmcpIGJvb2wgewoJXywgZXJyIDo9IGV4ZWMuTG9va1BhdGgo"
-    "bmFtZSkKCXJldHVybiBlcnIgPT0gbmlsCn0KCmZ1bmMgZW5zdXJlRGVwcyhjICpDb25maWcpIHsKCWlmIGMuUHJvdG9jb2wgPT0g"
-    "ImNpZnMiICYmICFoYXZlQ21kKCJtb3VudC5jaWZzIikgewoJCWlmIGMuSW5zdGFsbERlcHMgJiYgaGF2ZUNtZCgiYXB0LWdldCIp"
-    "IHsKCQkJbG9nZigibW91bnQuY2lmcyBtaXNzaW5nOyBpbnN0YWxsaW5nIGNpZnMtdXRpbHMgLi4uIikKCQkJY21kIDo9IGV4ZWMu"
-    "Q29tbWFuZCgiYXB0LWdldCIsICJpbnN0YWxsIiwgIi15IiwgImNpZnMtdXRpbHMiKQoJCQljbWQuRW52ID0gYXBwZW5kKG9zLkVu"
-    "dmlyb24oKSwgIkRFQklBTl9GUk9OVEVORD1ub25pbnRlcmFjdGl2ZSIpCgkJCW91dCwgZXJyIDo9IGNtZC5Db21iaW5lZE91dHB1"
-    "dCgpCgkJCWlmIGVyciAhPSBuaWwgewoJCQkJbG9nZigid2FybjogY2lmcy11dGlscyBpbnN0YWxsIGZhaWxlZDogJXZcbiVzIiwg"
-    "ZXJyLCBzdHJpbmcob3V0KSkKCQkJfQoJCX0gZWxzZSB7CgkJCWxvZ2YoIndhcm46IG1vdW50LmNpZnMgbm90IGZvdW5kOyBpbnN0"
-    "YWxsIGNpZnMtdXRpbHMgKGFwdC1nZXQgaW5zdGFsbCBjaWZzLXV0aWxzKSIpCgkJfQoJfQp9CgpmdW5jIGJ1aWxkU291cmNlKGMg"
-    "KkNvbmZpZywgbSBNb3VudFNwZWMpIHN0cmluZyB7CglpZiBjLlByb3RvY29sID09ICJuZnMiIHsKCQlyZXR1cm4gZm10LlNwcmlu"
-    "dGYoIiVzOiVzIiwgYy5Ib3N0LCBtLlJlbW90ZSkKCX0KCS8vIGNpZnMKCXJlbSA6PSBzdHJpbmdzLlRyaW1QcmVmaXgobS5SZW1v"
-    "dGUsICIvIikKCXJldHVybiBmbXQuU3ByaW50ZigiLy8lcy8lcyIsIGMuSG9zdCwgcmVtKQp9CgpmdW5jIG1vdW50T25lKGMgKkNv"
-    "bmZpZywgbSBNb3VudFNwZWMpIGVycm9yIHsKCWlmIGlzTW91bnRlZChtLkxvY2FsKSB7CgkJbG9nZigiYWxyZWFkeSBtb3VudGVk"
-    "OiAlcyIsIG0uTG9jYWwpCgkJcmV0dXJuIG5pbAoJfQoJaWYgZXJyIDo9IG9zLk1rZGlyQWxsKG0uTG9jYWwsIDBvNzU1KTsgZXJy"
-    "ICE9IG5pbCB7CgkJcmV0dXJuIGZtdC5FcnJvcmYoIm1rZGlyICVzOiAldyIsIG0uTG9jYWwsIGVycikKCX0KCglvcHRzIDo9IGMu"
-    "RGVmYXVsdE9wdGlvbnMKCWlmIHN0cmluZ3MuVHJpbVNwYWNlKG0uT3B0aW9ucykgIT0gIiIgewoJCW9wdHMgPSBtLk9wdGlvbnMK"
-    "CX0KCglzcmMgOj0gYnVpbGRTb3VyY2UoYywgbSkKCXZhciBjbWQgKmV4ZWMuQ21kCgoJaWYgYy5Qcm90b2NvbCA9PSAiY2lmcyIg"
-    "ewoJCS8vIGNyZWRlbnRpYWxzIHZpYSBlbnZpcm9ubWVudCwgbmV2ZXIgYXJndi9kaXNrCgkJcGFydHMgOj0gW11zdHJpbmd7fQoJ"
-    "CWlmIG9wdHMgIT0gIiIgewoJCQlwYXJ0cyA9IGFwcGVuZChwYXJ0cywgb3B0cykKCQl9CgkJcGFydHMgPSBhcHBlbmQocGFydHMs"
-    "ICJ1c2VybmFtZT0iK2MuVXNlcm5hbWUpCgkJaWYgYy5Eb21haW4gIT0gIiIgewoJCQlwYXJ0cyA9IGFwcGVuZChwYXJ0cywgImRv"
-    "bWFpbj0iK2MuRG9tYWluKQoJCX0KCQlmdWxsIDo9IHN0cmluZ3MuSm9pbihwYXJ0cywgIiwiKQoJCWNtZCA9IGV4ZWMuQ29tbWFu"
-    "ZCgibW91bnQuY2lmcyIsIHNyYywgbS5Mb2NhbCwgIi1vIiwgZnVsbCkKCQljbWQuRW52ID0gYXBwZW5kKG9zLkVudmlyb24oKSwg"
-    "IlBBU1NXRD0iK2MuUGFzc3dvcmQpCgl9IGVsc2UgewoJCWFyZ3MgOj0gW11zdHJpbmd7Ii10IiwgIm5mcyJ9CgkJaWYgb3B0cyAh"
-    "PSAiIiB7CgkJCWFyZ3MgPSBhcHBlbmQoYXJncywgIi1vIiwgb3B0cykKCQl9CgkJYXJncyA9IGFwcGVuZChhcmdzLCBzcmMsIG0u"
-    "TG9jYWwpCgkJY21kID0gZXhlYy5Db21tYW5kKCJtb3VudCIsIGFyZ3MuLi4pCgl9CgoJb3V0LCBlcnIgOj0gY21kLkNvbWJpbmVk"
-    "T3V0cHV0KCkKCWlmIGVyciAhPSBuaWwgewoJCXJldHVybiBmbXQuRXJyb3JmKCJtb3VudCAlcyAtPiAlcyBmYWlsZWQ6ICV2OiAl"
-    "cyIsIHNyYywgbS5Mb2NhbCwgZXJyLCBzdHJpbmdzLlRyaW1TcGFjZShzdHJpbmcob3V0KSkpCgl9Cglsb2dmKCJtb3VudGVkICVz"
-    "IC0+ICVzIiwgc3JjLCBtLkxvY2FsKQoJcmV0dXJuIG5pbAp9CgpmdW5jIG9uZXNob3QoKSBpbnQgewoJcmVxdWlyZVJvb3QoKQoJ"
-    "YywgZXJyIDo9IGxvYWRDb25maWcoKQoJaWYgZXJyICE9IG5pbCB7CgkJbG9nZigiZmF0YWw6ICV2IiwgZXJyKQoJCXJldHVybiAy"
-    "Cgl9CgllbnN1cmVEZXBzKGMpCgoJYXR0ZW1wdHMgOj0gYy5SZXRyeUF0dGVtcHRzCglpZiBhdHRlbXB0cyA8IDEgewoJCWF0dGVt"
-    "cHRzID0gMQoJfQoJZGVsYXkgOj0gdGltZS5EdXJhdGlvbihjLlJldHJ5RGVsYXlTZWMpICogdGltZS5TZWNvbmQKCWlmIGRlbGF5"
-    "IDw9IDAgewoJCWRlbGF5ID0gNSAqIHRpbWUuU2Vjb25kCgl9CgoJcGVuZGluZyA6PSBhcHBlbmQoW11Nb3VudFNwZWN7fSwgYy5N"
-    "b3VudHMuLi4pCgl2YXIgbGFzdEVyciBlcnJvcgoJZm9yIGF0dGVtcHQgOj0gMTsgYXR0ZW1wdCA8PSBhdHRlbXB0cyAmJiBsZW4o"
-    "cGVuZGluZykgPiAwOyBhdHRlbXB0KysgewoJCXZhciBzdGlsbFBlbmRpbmcgW11Nb3VudFNwZWMKCQlmb3IgXywgbSA6PSByYW5n"
-    "ZSBwZW5kaW5nIHsKCQkJaWYgZXJyIDo9IG1vdW50T25lKGMsIG0pOyBlcnIgIT0gbmlsIHsKCQkJCWxvZ2YoImF0dGVtcHQgJWQv"
-    "JWQ6ICV2IiwgYXR0ZW1wdCwgYXR0ZW1wdHMsIGVycikKCQkJCWxhc3RFcnIgPSBlcnIKCQkJCXN0aWxsUGVuZGluZyA9IGFwcGVu"
-    "ZChzdGlsbFBlbmRpbmcsIG0pCgkJCX0KCQl9CgkJcGVuZGluZyA9IHN0aWxsUGVuZGluZwoJCWlmIGxlbihwZW5kaW5nKSA+IDAg"
-    "JiYgYXR0ZW1wdCA8IGF0dGVtcHRzIHsKCQkJLy8gbGluZWFyLWlzaCBiYWNrb2ZmLCBjYXBwZWQKCQkJZCA6PSBkZWxheSAqIHRp"
-    "bWUuRHVyYXRpb24oYXR0ZW1wdCkKCQkJaWYgZCA+IDYwKnRpbWUuU2Vjb25kIHsKCQkJCWQgPSA2MCAqIHRpbWUuU2Vjb25kCgkJ"
-    "CX0KCQkJbG9nZigiJWQgbW91bnQocykgcGVuZGluZywgcmV0cnlpbmcgaW4gJXMgLi4uIiwgbGVuKHBlbmRpbmcpLCBkKQoJCQl0"
-    "aW1lLlNsZWVwKGQpCgkJfQoJfQoKCWlmIGxlbihwZW5kaW5nKSA+IDAgewoJCWxvZ2YoImdpdmluZyB1cDogJWQgbW91bnQocykg"
-    "c3RpbGwgbm90IG1vdW50ZWQgKGxhc3QgZXJyb3I6ICV2KSIsIGxlbihwZW5kaW5nKSwgbGFzdEVycikKCQlyZXR1cm4gMSAvLyBu"
-    "b24temVybywgYnV0IGJvb3QgaXMgdW5hZmZlY3RlZCBiZWNhdXNlIG5vdGhpbmcgZGVwZW5kcyBvbiB0aGlzIHVuaXQKCX0KCWxv"
-    "Z2YoImFsbCBtb3VudHMgdXAiKQoJcmV0dXJuIDAKfQoKZnVuYyBzdGF0dXMoKSBpbnQgewoJYywgZXJyIDo9IGxvYWRDb25maWco"
-    "KQoJaWYgZXJyICE9IG5pbCB7CgkJbG9nZigiZmF0YWw6ICV2IiwgZXJyKQoJCXJldHVybiAyCgl9Cglmb3IgXywgbSA6PSByYW5n"
-    "ZSBjLk1vdW50cyB7CgkJc3RhdGUgOj0gIk5PVCBtb3VudGVkIgoJCWlmIGlzTW91bnRlZChtLkxvY2FsKSB7CgkJCXN0YXRlID0g"
-    "Im1vdW50ZWQiCgkJfQoJCWZtdC5QcmludGYoIiUtMzBzICVzXG4iLCBtLkxvY2FsLCBzdGF0ZSkKCX0KCXJldHVybiAwCn0KCmZ1"
-    "bmMgc2VsZnRlc3QoKSBpbnQgewoJYywgZXJyIDo9IGxvYWRDb25maWcoKQoJaWYgZXJyICE9IG5pbCB7CgkJbG9nZigic2VsZnRl"
-    "c3QgRkFJTEVEOiAldiIsIGVycikKCQlyZXR1cm4gMgoJfQoJbWFza2VkIDo9ICI/IgoJaWYgbGVuKGMuSG9zdCkgPiAwIHsKCQlt"
-    "YXNrZWQgPSBzdHJpbmcoYy5Ib3N0WzBdKSArICIqKioiCgl9CglmbXQuUHJpbnRmKCJjb25maWcgZGVjcnlwdGVkIE9LOiBwcm90"
-    "b2NvbD0lcyBob3N0PSVzIG1vdW50cz0lZFxuIiwgYy5Qcm90b2NvbCwgbWFza2VkLCBsZW4oYy5Nb3VudHMpKQoJcmV0dXJuIDAK"
-    "fQoKY29uc3QgdW5pdFRlbXBsYXRlID0gYFtVbml0XQpEZXNjcmlwdGlvbj1OQVMgYXV0byBtb3VudCAobmFzLWVucC1tb3VudCkK"
-    "QWZ0ZXI9bmV0d29yay1vbmxpbmUudGFyZ2V0CldhbnRzPW5ldHdvcmstb25saW5lLnRhcmdldAojIEludGVudGlvbmFsbHkgbm8g"
-    "UmVxdWlyZXMgZnJvbSBvdGhlciB1bml0cyAtPiBmYWlsdXJlcyBuZXZlciBibG9jayBib290LgpTdGFydExpbWl0SW50ZXJ2YWxT"
-    "ZWM9MAoKW1NlcnZpY2VdClR5cGU9b25lc2hvdApSZW1haW5BZnRlckV4aXQ9eWVzCkV4ZWNTdGFydD0lcy8lcyAtLW9uZXNob3QK"
-    "IyBCb3VuZGVkIHNvIGEgZGVhZCBOQVMgY2FuIG5ldmVyIGhhbmcgYm9vdDsgcmV0cmllcyBoYXBwZW4gaW5zaWRlIHRoaXMgYnVk"
-    "Z2V0LgpUaW1lb3V0U3RhcnRTZWM9MTUwCgpbSW5zdGFsbF0KV2FudGVkQnk9bXVsdGktdXNlci50YXJnZXQKYAoKZnVuYyBpbnN0"
-    "YWxsU2VydmljZSgpIGludCB7CglyZXF1aXJlUm9vdCgpCglpZiBfLCBlcnIgOj0gbG9hZENvbmZpZygpOyBlcnIgIT0gbmlsIHsK"
-    "CQlsb2dmKCJyZWZ1c2luZyB0byBpbnN0YWxsOiAldiIsIGVycikKCQlyZXR1cm4gMgoJfQoJaWYgZXJyIDo9IG9zLk1rZGlyQWxs"
-    "KGluc3RhbGxEaXIsIDBvNzAwKTsgZXJyICE9IG5pbCB7CgkJbG9nZigiZmF0YWw6ICV2IiwgZXJyKQoJCXJldHVybiAyCgl9Cgkv"
-    "LyBjb3B5IHNlbGYgaW50byBpbnN0YWxsRGlyIGlmIHJ1bm5pbmcgZnJvbSBlbHNld2hlcmUKCXNlbGYsIF8gOj0gb3MuRXhlY3V0"
-    "YWJsZSgpCgl0YXJnZXQgOj0gZmlsZXBhdGguSm9pbihpbnN0YWxsRGlyLCBiaW5OYW1lKQoJaWYgYWJzLCBfIDo9IGZpbGVwYXRo"
-    "LkFicyhzZWxmKTsgYWJzICE9IHRhcmdldCB7CgkJZGF0YSwgZXJyIDo9IG9zLlJlYWRGaWxlKHNlbGYpCgkJaWYgZXJyICE9IG5p"
-    "bCB7CgkJCWxvZ2YoImZhdGFsOiByZWFkIHNlbGY6ICV2IiwgZXJyKQoJCQlyZXR1cm4gMgoJCX0KCQlpZiBlcnIgOj0gb3MuV3Jp"
-    "dGVGaWxlKHRhcmdldCwgZGF0YSwgMG83MDApOyBlcnIgIT0gbmlsIHsKCQkJbG9nZigiZmF0YWw6IHdyaXRlICVzOiAldiIsIHRh"
-    "cmdldCwgZXJyKQoJCQlyZXR1cm4gMgoJCX0KCQlsb2dmKCJpbnN0YWxsZWQgYmluYXJ5IHRvICVzIiwgdGFyZ2V0KQoJfQoJdW5p"
-    "dCA6PSBmbXQuU3ByaW50Zih1bml0VGVtcGxhdGUsIGluc3RhbGxEaXIsIGJpbk5hbWUpCgl1bml0UGF0aCA6PSAiL2V0Yy9zeXN0"
-    "ZW1kL3N5c3RlbS8iICsgc2VydmljZU5hbWUKCWlmIGVyciA6PSBvcy5Xcml0ZUZpbGUodW5pdFBhdGgsIFtdYnl0ZSh1bml0KSwg"
-    "MG82NDQpOyBlcnIgIT0gbmlsIHsKCQlsb2dmKCJmYXRhbDogd3JpdGUgdW5pdDogJXYiLCBlcnIpCgkJcmV0dXJuIDIKCX0KCWxv"
-    "Z2YoIndyb3RlICVzIiwgdW5pdFBhdGgpCglmb3IgXywgYXJncyA6PSByYW5nZSBbXVtdc3RyaW5newoJCXsiZGFlbW9uLXJlbG9h"
-    "ZCJ9LAoJCXsiZW5hYmxlIiwgc2VydmljZU5hbWV9LAoJCXsic3RhcnQiLCBzZXJ2aWNlTmFtZX0sCgl9IHsKCQlvdXQsIGVyciA6"
-    "PSBleGVjLkNvbW1hbmQoInN5c3RlbWN0bCIsIGFyZ3MuLi4pLkNvbWJpbmVkT3V0cHV0KCkKCQlpZiBlcnIgIT0gbmlsIHsKCQkJ"
-    "bG9nZigid2Fybjogc3lzdGVtY3RsICV2OiAldjogJXMiLCBhcmdzLCBlcnIsIHN0cmluZ3MuVHJpbVNwYWNlKHN0cmluZyhvdXQp"
-    "KSkKCQl9Cgl9Cglsb2dmKCJzZXJ2aWNlIGluc3RhbGxlZCBhbmQgc3RhcnRlZC4gQ2hlY2s6IHN5c3RlbWN0bCBzdGF0dXMgJXMi"
-    "LCBzZXJ2aWNlTmFtZSkKCXJldHVybiAwCn0KCmZ1bmMgdW5pbnN0YWxsKCkgaW50IHsKCXJlcXVpcmVSb290KCkKCWV4ZWMuQ29t"
-    "bWFuZCgic3lzdGVtY3RsIiwgImRpc2FibGUiLCAiLS1ub3ciLCBzZXJ2aWNlTmFtZSkuUnVuKCkKCW9zLlJlbW92ZSgiL2V0Yy9z"
-    "eXN0ZW1kL3N5c3RlbS8iICsgc2VydmljZU5hbWUpCglleGVjLkNvbW1hbmQoInN5c3RlbWN0bCIsICJkYWVtb24tcmVsb2FkIiku"
-    "UnVuKCkKCWlmIGMsIGVyciA6PSBsb2FkQ29uZmlnKCk7IGVyciA9PSBuaWwgewoJCWZvciBfLCBtIDo9IHJhbmdlIGMuTW91bnRz"
-    "IHsKCQkJaWYgaXNNb3VudGVkKG0uTG9jYWwpIHsKCQkJCW91dCwgZXJyIDo9IGV4ZWMuQ29tbWFuZCgidW1vdW50IiwgbS5Mb2Nh"
-    "bCkuQ29tYmluZWRPdXRwdXQoKQoJCQkJaWYgZXJyICE9IG5pbCB7CgkJCQkJbG9nZigid2FybjogdW1vdW50ICVzOiAldjogJXMi"
-    "LCBtLkxvY2FsLCBlcnIsIHN0cmluZ3MuVHJpbVNwYWNlKHN0cmluZyhvdXQpKSkKCQkJCX0gZWxzZSB7CgkJCQkJbG9nZigidW5t"
-    "b3VudGVkICVzIiwgbS5Mb2NhbCkKCQkJCX0KCQkJfQoJCX0KCX0KCWxvZ2YoInVuaW5zdGFsbGVkIikKCXJldHVybiAwCn0KCmZ1"
-    "bmMgdXNhZ2UoKSB7CglmbXQuUHJpbnRsbihgbmFzLWVucC1tb3VudAogIChubyBhcmdzKSAvIC0tb25lc2hvdCAgIG1vdW50IGFs"
-    "bCBzaGFyZXMgb25jZSAod2l0aCBpbnRlcm5hbCByZXRyaWVzKQogIC0taW5zdGFsbC1zZXJ2aWNlICAgICAgIGluc3RhbGwgJiBl"
-    "bmFibGUgc3lzdGVtZCBib290IHNlcnZpY2UKICAtLXVuaW5zdGFsbCAgICAgICAgICAgICBzdG9wIHNlcnZpY2UsIHJlbW92ZSB1"
-    "bml0LCB1bm1vdW50IHNoYXJlcwogIC0tc3RhdHVzICAgICAgICAgICAgICAgIHNob3cgbW91bnQgc3RhdHVzCiAgLS1zZWxmdGVz"
-    "dCAgICAgICAgICAgICAgdmVyaWZ5IGVtYmVkZGVkIGNvbmZpZyBkZWNyeXB0cyAobm8gc2VjcmV0cyBwcmludGVkKWApCn0KCmZ1"
-    "bmMgbWFpbigpIHsKCW1vZGUgOj0gIi0tb25lc2hvdCIKCWlmIGxlbihvcy5BcmdzKSA+IDEgewoJCW1vZGUgPSBvcy5BcmdzWzFd"
-    "Cgl9Cglzd2l0Y2ggbW9kZSB7CgljYXNlICItLW9uZXNob3QiLCAiIjoKCQlvcy5FeGl0KG9uZXNob3QoKSkKCWNhc2UgIi0taW5z"
-    "dGFsbC1zZXJ2aWNlIjoKCQlvcy5FeGl0KGluc3RhbGxTZXJ2aWNlKCkpCgljYXNlICItLXVuaW5zdGFsbCI6CgkJb3MuRXhpdCh1"
-    "bmluc3RhbGwoKSkKCWNhc2UgIi0tc3RhdHVzIjoKCQlvcy5FeGl0KHN0YXR1cygpKQoJY2FzZSAiLS1zZWxmdGVzdCI6CgkJb3Mu"
-    "RXhpdChzZWxmdGVzdCgpKQoJY2FzZSAiLWgiLCAiLS1oZWxwIiwgImhlbHAiOgoJCXVzYWdlKCkKCWRlZmF1bHQ6CgkJdXNhZ2Uo"
-    "KQoJCW9zLkV4aXQoMikKCX0KfQo=")
+# ---- Embedded Python client template (base64) ----
+PY_CLIENT_TEMPLATE_B64 = (
+    "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKbmFzLWVucC1tb3VudCBjbGllbnQKQnVpbHQgZnJvbSBhbiBlbmNyeXB0ZWQgY29u"
+    "ZmlnIGJsb2IgZW1iZWRkZWQgYXQgZ2VuZXJhdGlvbiB0aW1lLgpUaGUgcGxhaW50ZXh0IGNvbmZpZyBuZXZlciB0b3VjaGVzIGRp"
+    "c2sgb24gdGhlIGNsaWVudC4KIiIiCmltcG9ydCBiYXNlNjQKaW1wb3J0IGpzb24KaW1wb3J0IG9zCmltcG9ydCBzdWJwcm9jZXNz"
+    "CmltcG9ydCBzeXMKaW1wb3J0IHRpbWUKZnJvbSBzaHV0aWwgaW1wb3J0IHdoaWNoCgpJTlNUQUxMX0RJUiA9ICIvcm9vdC9uYXMt"
+    "ZW5wLW1vdW50IgpCSU5fTkFNRSA9ICJuYXMtZW5wLW1vdW50LnB5IgpTRVJWSUNFX05BTUUgPSAibmFzLWVucC1tb3VudC5zZXJ2"
+    "aWNlIgoKIyAtLS0tIEVtYmVkZGVkIGJsb2IgKGZpbGxlZCBpbiBieSB0aGUgZ2VuZXJhdG9yKSAtLS0tCkJMT0JfQ0lQSEVSID0g"
+    "Il9fQ0lQSEVSVEVYVF9fIgpCTE9CX05PTkNFID0gIl9fTk9OQ0VfXyIKQkxPQl9LRVlBID0gIl9fS0VZQV9fIgpCTE9CX0tFWVBB"
+    "RCA9ICJfX0tFWVBBRF9fIgoKCmRlZiBsb2dmKG1zZyk6CiAgICBwcmludChmIltuYXMtZW5wLW1vdW50XSB7bXNnfSIsIGZpbGU9"
+    "c3lzLnN0ZGVycikKCgpkZWYgX3BpcF9pbnN0YWxsKHBrZyk6CiAgICByID0gc3VicHJvY2Vzcy5ydW4oW3N5cy5leGVjdXRhYmxl"
+    "LCAiLW0iLCAicGlwIiwgImluc3RhbGwiLCAiLS1xdWlldCIsIHBrZ10sCiAgICAgICAgICAgICAgICAgICAgICAgIGNhcHR1cmVf"
+    "b3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAgIGlmIHIucmV0dXJuY29kZSAhPSAwOgogICAgICAgICMgcGlwIG1vZHVsZSBtYXkg"
+    "YmUgbWlzc2luZyBlbnRpcmVseSBvbiBhIG1pbmltYWwgaW1hZ2U7IGJvb3RzdHJhcCBpdCBvbmNlLgogICAgICAgIHN1YnByb2Nl"
+    "c3MucnVuKFtzeXMuZXhlY3V0YWJsZSwgIi1tIiwgImVuc3VyZXBpcCIsICItLWRlZmF1bHQtcGlwIl0sCiAgICAgICAgICAgICAg"
+    "ICAgICAgICAgIGNhcHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAgICAgICByID0gc3VicHJvY2Vzcy5ydW4oW3N5cy5l"
+    "eGVjdXRhYmxlLCAiLW0iLCAicGlwIiwgImluc3RhbGwiLCAiLS1xdWlldCIsIHBrZ10sCiAgICAgICAgICAgICAgICAgICAgICAg"
+    "ICAgICBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUpCiAgICByZXR1cm4gcgoKCmRlZiBlbnN1cmVfY3J5cHRvKCk6CiAg"
+    "ICB0cnk6CiAgICAgICAgZnJvbSBjcnlwdG9ncmFwaHkuaGF6bWF0LnByaW1pdGl2ZXMuY2lwaGVycy5hZWFkIGltcG9ydCBBRVNH"
+    "Q00KICAgICAgICByZXR1cm4gQUVTR0NNCiAgICBleGNlcHQgSW1wb3J0RXJyb3I6CiAgICAgICAgbG9nZigiY3J5cHRvZ3JhcGh5"
+    "IHBhY2thZ2UgbWlzc2luZzsgaW5zdGFsbGluZyB2aWEgcGlwIC4uLiIpCiAgICAgICAgciA9IF9waXBfaW5zdGFsbCgiY3J5cHRv"
+    "Z3JhcGh5IikKICAgICAgICBpZiByLnJldHVybmNvZGUgIT0gMDoKICAgICAgICAgICAgbG9nZihmImZhdGFsOiBwaXAgaW5zdGFs"
+    "bCBjcnlwdG9ncmFwaHkgZmFpbGVkOlxue3Iuc3Rkb3V0fXtyLnN0ZGVycn0iKQogICAgICAgICAgICBzeXMuZXhpdCgyKQogICAg"
+    "ICAgIHRyeToKICAgICAgICAgICAgZnJvbSBjcnlwdG9ncmFwaHkuaGF6bWF0LnByaW1pdGl2ZXMuY2lwaGVycy5hZWFkIGltcG9y"
+    "dCBBRVNHQ00KICAgICAgICAgICAgcmV0dXJuIEFFU0dDTQogICAgICAgIGV4Y2VwdCBJbXBvcnRFcnJvcjoKICAgICAgICAgICAg"
+    "bG9nZigiZmF0YWw6IGNyeXB0b2dyYXBoeSBzdGlsbCBub3QgaW1wb3J0YWJsZSBhZnRlciBpbnN0YWxsIikKICAgICAgICAgICAg"
+    "c3lzLmV4aXQoMikKCgpBRVNHQ00gPSBlbnN1cmVfY3J5cHRvKCkKCgpkZWYgZGVjb2RlX2I2NChzKToKICAgIHRyeToKICAgICAg"
+    "ICByZXR1cm4gYmFzZTY0LmI2NGRlY29kZShzKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIGxvZ2YoZiJmYXRh"
+    "bDogYmxvYiBkZWNvZGUgZXJyb3I6IHtlfSIpCiAgICAgICAgc3lzLmV4aXQoMikKCgpkZWYgbG9hZF9jb25maWcoKToKICAgIGtl"
+    "eV9hID0gZGVjb2RlX2I2NChCTE9CX0tFWUEpCiAgICBrZXlfcGFkID0gZGVjb2RlX2I2NChCTE9CX0tFWVBBRCkKICAgIGlmIGxl"
+    "bihrZXlfYSkgIT0gbGVuKGtleV9wYWQpOgogICAgICAgIHJhaXNlIFJ1bnRpbWVFcnJvcigia2V5IG1hdGVyaWFsIGxlbmd0aCBt"
+    "aXNtYXRjaCIpCiAgICBrZXkgPSBieXRlYXJyYXkoYSBeIGIgZm9yIGEsIGIgaW4gemlwKGtleV9hLCBrZXlfcGFkKSkKICAgIHRy"
+    "eToKICAgICAgICBwbGFpbiA9IEFFU0dDTShieXRlcyhrZXkpKS5kZWNyeXB0KGRlY29kZV9iNjQoQkxPQl9OT05DRSksIGRlY29k"
+    "ZV9iNjQoQkxPQl9DSVBIRVIpLCBOb25lKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHJhaXNlIFJ1bnRpbWVF"
+    "cnJvcihmImNvbmZpZyBhdXRoL2RlY3J5cHQgZmFpbGVkOiB7ZX0iKQogICAgZmluYWxseToKICAgICAgICAjIGJlc3QtZWZmb3J0"
+    "IHplcm9pbmcgb2YgdGhlIG11dGFibGUgY29weTsgdGhlIGJ5dGVzKCkgY29weSBwYXNzZWQgdG8KICAgICAgICAjIEFFU0dDTSBh"
+    "Ym92ZSBpcyBpbW11dGFibGUgYW5kIGNhbid0IGJlIHplcm9lZCB0aGUgc2FtZSB3YXkKICAgICAgICBmb3IgaSBpbiByYW5nZShs"
+    "ZW4oa2V5KSk6CiAgICAgICAgICAgIGtleVtpXSA9IDAKICAgIHJldHVybiBqc29uLmxvYWRzKHBsYWluKQoKCmRlZiByZXF1aXJl"
+    "X3Jvb3QoKToKICAgIGlmIG9zLmdldGV1aWQoKSAhPSAwOgogICAgICAgIGxvZ2YoImZhdGFsOiBtdXN0IGJlIHJ1biBhcyByb290"
+    "IikKICAgICAgICBzeXMuZXhpdCgxKQoKCmRlZiBpc19tb3VudGVkKHRhcmdldCk6CiAgICB0cnk6CiAgICAgICAgd2l0aCBvcGVu"
+    "KCIvcHJvYy9tb3VudHMiKSBhcyBmOgogICAgICAgICAgICBkYXRhID0gZi5yZWFkKCkKICAgIGV4Y2VwdCBPU0Vycm9yOgogICAg"
+    "ICAgIHJldHVybiBGYWxzZQogICAgYWJzX3RhcmdldCA9IG9zLnBhdGguYWJzcGF0aCh0YXJnZXQpCiAgICBmb3IgbGluZSBpbiBk"
+    "YXRhLnNwbGl0bGluZXMoKToKICAgICAgICBmaWVsZHMgPSBsaW5lLnNwbGl0KCkKICAgICAgICBpZiBsZW4oZmllbGRzKSA+PSAy"
+    "IGFuZCBmaWVsZHNbMV0gaW4gKGFic190YXJnZXQsIHRhcmdldCk6CiAgICAgICAgICAgIHJldHVybiBUcnVlCiAgICByZXR1cm4g"
+    "RmFsc2UKCgpkZWYgaGF2ZV9jbWQobmFtZSk6CiAgICByZXR1cm4gd2hpY2gobmFtZSkgaXMgbm90IE5vbmUKCgpkZWYgZW5zdXJl"
+    "X2RlcHMoY2ZnKToKICAgIGlmIGNmZ1sicHJvdG9jb2wiXSA9PSAiY2lmcyIgYW5kIG5vdCBoYXZlX2NtZCgibW91bnQuY2lmcyIp"
+    "OgogICAgICAgIGlmIGNmZy5nZXQoImluc3RhbGxfZGVwcyIpIGFuZCBoYXZlX2NtZCgiYXB0LWdldCIpOgogICAgICAgICAgICBs"
+    "b2dmKCJtb3VudC5jaWZzIG1pc3Npbmc7IGluc3RhbGxpbmcgY2lmcy11dGlscyAuLi4iKQogICAgICAgICAgICBlbnYgPSBkaWN0"
+    "KG9zLmVudmlyb24sIERFQklBTl9GUk9OVEVORD0ibm9uaW50ZXJhY3RpdmUiKQogICAgICAgICAgICByID0gc3VicHJvY2Vzcy5y"
+    "dW4oWyJhcHQtZ2V0IiwgImluc3RhbGwiLCAiLXkiLCAiY2lmcy11dGlscyJdLAogICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+    "ICAgIGVudj1lbnYsIGNhcHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAgICAgICAgICAgaWYgci5yZXR1cm5jb2RlICE9"
+    "IDA6CiAgICAgICAgICAgICAgICBsb2dmKGYid2FybjogY2lmcy11dGlscyBpbnN0YWxsIGZhaWxlZDoge3IucmV0dXJuY29kZX1c"
+    "bntyLnN0ZG91dH17ci5zdGRlcnJ9IikKICAgICAgICBlbHNlOgogICAgICAgICAgICBsb2dmKCJ3YXJuOiBtb3VudC5jaWZzIG5v"
+    "dCBmb3VuZDsgaW5zdGFsbCBjaWZzLXV0aWxzIChhcHQtZ2V0IGluc3RhbGwgY2lmcy11dGlscykiKQoKCmRlZiBidWlsZF9zb3Vy"
+    "Y2UoY2ZnLCBtKToKICAgIGlmIGNmZ1sicHJvdG9jb2wiXSA9PSAibmZzIjoKICAgICAgICByZXR1cm4gZid7Y2ZnWyJob3N0Il19"
+    "OnttWyJyZW1vdGUiXX0nCiAgICByZW0gPSBtWyJyZW1vdGUiXS5sc3RyaXAoIi8iKQogICAgcmV0dXJuIGYnLy97Y2ZnWyJob3N0"
+    "Il19L3tyZW19JwoKCmRlZiBtb3VudF9vbmUoY2ZnLCBtKToKICAgIGlmIGlzX21vdW50ZWQobVsibG9jYWwiXSk6CiAgICAgICAg"
+    "bG9nZihmJ2FscmVhZHkgbW91bnRlZDoge21bImxvY2FsIl19JykKICAgICAgICByZXR1cm4gTm9uZQogICAgdHJ5OgogICAgICAg"
+    "IG9zLm1ha2VkaXJzKG1bImxvY2FsIl0sIG1vZGU9MG83NTUsIGV4aXN0X29rPVRydWUpCiAgICBleGNlcHQgT1NFcnJvciBhcyBl"
+    "OgogICAgICAgIHJldHVybiBmJ21rZGlyIHttWyJsb2NhbCJdfToge2V9JwoKICAgIG9wdHMgPSBjZmcuZ2V0KCJkZWZhdWx0X29w"
+    "dGlvbnMiLCAiIikKICAgIGlmIG0uZ2V0KCJvcHRpb25zIiwgIiIpLnN0cmlwKCk6CiAgICAgICAgb3B0cyA9IG1bIm9wdGlvbnMi"
+    "XQoKICAgIHNyYyA9IGJ1aWxkX3NvdXJjZShjZmcsIG0pCiAgICBpZiBjZmdbInByb3RvY29sIl0gPT0gImNpZnMiOgogICAgICAg"
+    "IHBhcnRzID0gW10KICAgICAgICBpZiBvcHRzOgogICAgICAgICAgICBwYXJ0cy5hcHBlbmQob3B0cykKICAgICAgICBwYXJ0cy5h"
+    "cHBlbmQoInVzZXJuYW1lPSIgKyBjZmdbInVzZXJuYW1lIl0pCiAgICAgICAgaWYgY2ZnLmdldCgiZG9tYWluIik6CiAgICAgICAg"
+    "ICAgIHBhcnRzLmFwcGVuZCgiZG9tYWluPSIgKyBjZmdbImRvbWFpbiJdKQogICAgICAgIGZ1bGwgPSAiLCIuam9pbihwYXJ0cykK"
+    "ICAgICAgICBlbnYgPSBkaWN0KG9zLmVudmlyb24sIFBBU1NXRD1jZmcuZ2V0KCJwYXNzd29yZCIsICIiKSkKICAgICAgICBjbWQg"
+    "PSBbIm1vdW50LmNpZnMiLCBzcmMsIG1bImxvY2FsIl0sICItbyIsIGZ1bGxdCiAgICBlbHNlOgogICAgICAgIGFyZ3MgPSBbIi10"
+    "IiwgIm5mcyJdCiAgICAgICAgaWYgb3B0czoKICAgICAgICAgICAgYXJncyArPSBbIi1vIiwgb3B0c10KICAgICAgICBhcmdzICs9"
+    "IFtzcmMsIG1bImxvY2FsIl1dCiAgICAgICAgY21kID0gWyJtb3VudCJdICsgYXJncwogICAgICAgIGVudiA9IG9zLmVudmlyb24u"
+    "Y29weSgpCgogICAgciA9IHN1YnByb2Nlc3MucnVuKGNtZCwgZW52PWVudiwgY2FwdHVyZV9vdXRwdXQ9VHJ1ZSwgdGV4dD1UcnVl"
+    "KQogICAgaWYgci5yZXR1cm5jb2RlICE9IDA6CiAgICAgICAgcmV0dXJuIGYnbW91bnQge3NyY30gLT4ge21bImxvY2FsIl19IGZh"
+    "aWxlZDoge3IucmV0dXJuY29kZX06IHsoci5zdGRvdXQgKyByLnN0ZGVycikuc3RyaXAoKX0nCiAgICBsb2dmKGYnbW91bnRlZCB7"
+    "c3JjfSAtPiB7bVsibG9jYWwiXX0nKQogICAgcmV0dXJuIE5vbmUKCgpkZWYgb25lc2hvdCgpOgogICAgcmVxdWlyZV9yb290KCkK"
+    "ICAgIHRyeToKICAgICAgICBjZmcgPSBsb2FkX2NvbmZpZygpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgbG9n"
+    "ZihmImZhdGFsOiB7ZX0iKQogICAgICAgIHJldHVybiAyCiAgICBlbnN1cmVfZGVwcyhjZmcpCgogICAgYXR0ZW1wdHMgPSBjZmcu"
+    "Z2V0KCJyZXRyeV9hdHRlbXB0cyIpIG9yIDEKICAgIGlmIGF0dGVtcHRzIDwgMToKICAgICAgICBhdHRlbXB0cyA9IDEKICAgIGRl"
+    "bGF5ID0gY2ZnLmdldCgicmV0cnlfZGVsYXlfc2VjIikgb3IgNQogICAgaWYgZGVsYXkgPD0gMDoKICAgICAgICBkZWxheSA9IDUK"
+    "CiAgICBwZW5kaW5nID0gbGlzdChjZmdbIm1vdW50cyJdKQogICAgbGFzdF9lcnIgPSBOb25lCiAgICBhdHRlbXB0ID0gMQogICAg"
+    "d2hpbGUgYXR0ZW1wdCA8PSBhdHRlbXB0cyBhbmQgcGVuZGluZzoKICAgICAgICBzdGlsbF9wZW5kaW5nID0gW10KICAgICAgICBm"
+    "b3IgbSBpbiBwZW5kaW5nOgogICAgICAgICAgICBlcnIgPSBtb3VudF9vbmUoY2ZnLCBtKQogICAgICAgICAgICBpZiBlcnI6CiAg"
+    "ICAgICAgICAgICAgICBsb2dmKGYiYXR0ZW1wdCB7YXR0ZW1wdH0ve2F0dGVtcHRzfToge2Vycn0iKQogICAgICAgICAgICAgICAg"
+    "bGFzdF9lcnIgPSBlcnIKICAgICAgICAgICAgICAgIHN0aWxsX3BlbmRpbmcuYXBwZW5kKG0pCiAgICAgICAgcGVuZGluZyA9IHN0"
+    "aWxsX3BlbmRpbmcKICAgICAgICBpZiBwZW5kaW5nIGFuZCBhdHRlbXB0IDwgYXR0ZW1wdHM6CiAgICAgICAgICAgIGQgPSBtaW4o"
+    "ZGVsYXkgKiBhdHRlbXB0LCA2MCkKICAgICAgICAgICAgbG9nZihmIntsZW4ocGVuZGluZyl9IG1vdW50KHMpIHBlbmRpbmcsIHJl"
+    "dHJ5aW5nIGluIHtkfXMgLi4uIikKICAgICAgICAgICAgdGltZS5zbGVlcChkKQogICAgICAgIGF0dGVtcHQgKz0gMQoKICAgIGlm"
+    "IHBlbmRpbmc6CiAgICAgICAgbG9nZihmImdpdmluZyB1cDoge2xlbihwZW5kaW5nKX0gbW91bnQocykgc3RpbGwgbm90IG1vdW50"
+    "ZWQgKGxhc3QgZXJyb3I6IHtsYXN0X2Vycn0pIikKICAgICAgICByZXR1cm4gMSAgIyBub256ZXJvLCBidXQgYm9vdCBpcyB1bmFm"
+    "ZmVjdGVkIGJlY2F1c2Ugbm90aGluZyBkZXBlbmRzIG9uIHRoaXMgdW5pdAogICAgbG9nZigiYWxsIG1vdW50cyB1cCIpCiAgICBy"
+    "ZXR1cm4gMAoKCmRlZiBzdGF0dXMoKToKICAgIHRyeToKICAgICAgICBjZmcgPSBsb2FkX2NvbmZpZygpCiAgICBleGNlcHQgRXhj"
+    "ZXB0aW9uIGFzIGU6CiAgICAgICAgbG9nZihmImZhdGFsOiB7ZX0iKQogICAgICAgIHJldHVybiAyCiAgICBmb3IgbSBpbiBjZmdb"
+    "Im1vdW50cyJdOgogICAgICAgIHN0YXRlID0gIm1vdW50ZWQiIGlmIGlzX21vdW50ZWQobVsibG9jYWwiXSkgZWxzZSAiTk9UIG1v"
+    "dW50ZWQiCiAgICAgICAgcHJpbnQoZid7bVsibG9jYWwiXTo8MzB9IHtzdGF0ZX0nKQogICAgcmV0dXJuIDAKCgpkZWYgc2VsZnRl"
+    "c3QoKToKICAgIHRyeToKICAgICAgICBjZmcgPSBsb2FkX2NvbmZpZygpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAg"
+    "ICAgbG9nZihmInNlbGZ0ZXN0IEZBSUxFRDoge2V9IikKICAgICAgICByZXR1cm4gMgogICAgaG9zdCA9IGNmZy5nZXQoImhvc3Qi"
+    "LCAiIikKICAgIG1hc2tlZCA9IChob3N0WzBdICsgIioqKiIpIGlmIGhvc3QgZWxzZSAiPyIKICAgIHByaW50KGYnY29uZmlnIGRl"
+    "Y3J5cHRlZCBPSzogcHJvdG9jb2w9e2NmZ1sicHJvdG9jb2wiXX0gaG9zdD17bWFza2VkfSBtb3VudHM9e2xlbihjZmdbIm1vdW50"
+    "cyJdKX0nKQogICAgcmV0dXJuIDAKCgpVTklUX1RFTVBMQVRFID0gIiIiW1VuaXRdCkRlc2NyaXB0aW9uPU5BUyBhdXRvIG1vdW50"
+    "IChuYXMtZW5wLW1vdW50KQpBZnRlcj1uZXR3b3JrLW9ubGluZS50YXJnZXQKV2FudHM9bmV0d29yay1vbmxpbmUudGFyZ2V0CiMg"
+    "SW50ZW50aW9uYWxseSBubyBSZXF1aXJlcyBmcm9tIG90aGVyIHVuaXRzIC0+IGZhaWx1cmVzIG5ldmVyIGJsb2NrIGJvb3QuClN0"
+    "YXJ0TGltaXRJbnRlcnZhbFNlYz0wCgpbU2VydmljZV0KVHlwZT1vbmVzaG90ClJlbWFpbkFmdGVyRXhpdD15ZXMKRXhlY1N0YXJ0"
+    "PXtweXRob259IHtzY3JpcHR9IC0tb25lc2hvdAojIEJvdW5kZWQgc28gYSBkZWFkIE5BUyBjYW4gbmV2ZXIgaGFuZyBib290OyBy"
+    "ZXRyaWVzIGhhcHBlbiBpbnNpZGUgdGhpcyBidWRnZXQuClRpbWVvdXRTdGFydFNlYz0xNTAKCltJbnN0YWxsXQpXYW50ZWRCeT1t"
+    "dWx0aS11c2VyLnRhcmdldAoiIiIKCgpkZWYgaW5zdGFsbF9zZXJ2aWNlKCk6CiAgICByZXF1aXJlX3Jvb3QoKQogICAgdHJ5Ogog"
+    "ICAgICAgIGxvYWRfY29uZmlnKCkKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBsb2dmKGYicmVmdXNpbmcgdG8g"
+    "aW5zdGFsbDoge2V9IikKICAgICAgICByZXR1cm4gMgogICAgb3MubWFrZWRpcnMoSU5TVEFMTF9ESVIsIG1vZGU9MG83MDAsIGV4"
+    "aXN0X29rPVRydWUpCiAgICB0YXJnZXQgPSBvcy5wYXRoLmpvaW4oSU5TVEFMTF9ESVIsIEJJTl9OQU1FKQogICAgc2VsZl9wYXRo"
+    "ID0gb3MucGF0aC5hYnNwYXRoKF9fZmlsZV9fKQogICAgaWYgc2VsZl9wYXRoICE9IHRhcmdldDoKICAgICAgICB3aXRoIG9wZW4o"
+    "c2VsZl9wYXRoLCAicmIiKSBhcyBmOgogICAgICAgICAgICBkYXRhID0gZi5yZWFkKCkKICAgICAgICB3aXRoIG9wZW4odGFyZ2V0"
+    "LCAid2IiKSBhcyBmOgogICAgICAgICAgICBmLndyaXRlKGRhdGEpCiAgICAgICAgb3MuY2htb2QodGFyZ2V0LCAwbzcwMCkKICAg"
+    "ICAgICBsb2dmKGYiaW5zdGFsbGVkIHNjcmlwdCB0byB7dGFyZ2V0fSIpCgogICAgdW5pdCA9IFVOSVRfVEVNUExBVEUuZm9ybWF0"
+    "KHB5dGhvbj1zeXMuZXhlY3V0YWJsZSwgc2NyaXB0PXRhcmdldCkKICAgIHVuaXRfcGF0aCA9IGYiL2V0Yy9zeXN0ZW1kL3N5c3Rl"
+    "bS97U0VSVklDRV9OQU1FfSIKICAgIHdpdGggb3Blbih1bml0X3BhdGgsICJ3IikgYXMgZjoKICAgICAgICBmLndyaXRlKHVuaXQp"
+    "CiAgICBsb2dmKGYid3JvdGUge3VuaXRfcGF0aH0iKQogICAgZm9yIGFyZ3MgaW4gKFsiZGFlbW9uLXJlbG9hZCJdLCBbImVuYWJs"
+    "ZSIsIFNFUlZJQ0VfTkFNRV0sIFsic3RhcnQiLCBTRVJWSUNFX05BTUVdKToKICAgICAgICByID0gc3VicHJvY2Vzcy5ydW4oWyJz"
+    "eXN0ZW1jdGwiXSArIGFyZ3MsIGNhcHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAgICAgICBpZiByLnJldHVybmNvZGUg"
+    "IT0gMDoKICAgICAgICAgICAgbG9nZihmIndhcm46IHN5c3RlbWN0bCB7YXJnc306IHtyLnJldHVybmNvZGV9OiB7KHIuc3Rkb3V0"
+    "ICsgci5zdGRlcnIpLnN0cmlwKCl9IikKICAgIGxvZ2YoZiJzZXJ2aWNlIGluc3RhbGxlZCBhbmQgc3RhcnRlZC4gQ2hlY2s6IHN5"
+    "c3RlbWN0bCBzdGF0dXMge1NFUlZJQ0VfTkFNRX0iKQogICAgcmV0dXJuIDAKCgpkZWYgdW5pbnN0YWxsKCk6CiAgICByZXF1aXJl"
+    "X3Jvb3QoKQogICAgc3VicHJvY2Vzcy5ydW4oWyJzeXN0ZW1jdGwiLCAiZGlzYWJsZSIsICItLW5vdyIsIFNFUlZJQ0VfTkFNRV0s"
+    "IGNhcHR1cmVfb3V0cHV0PVRydWUpCiAgICB0cnk6CiAgICAgICAgb3MucmVtb3ZlKGYiL2V0Yy9zeXN0ZW1kL3N5c3RlbS97U0VS"
+    "VklDRV9OQU1FfSIpCiAgICBleGNlcHQgT1NFcnJvcjoKICAgICAgICBwYXNzCiAgICBzdWJwcm9jZXNzLnJ1bihbInN5c3RlbWN0"
+    "bCIsICJkYWVtb24tcmVsb2FkIl0sIGNhcHR1cmVfb3V0cHV0PVRydWUpCiAgICB0cnk6CiAgICAgICAgY2ZnID0gbG9hZF9jb25m"
+    "aWcoKQogICAgICAgIGZvciBtIGluIGNmZ1sibW91bnRzIl06CiAgICAgICAgICAgIGlmIGlzX21vdW50ZWQobVsibG9jYWwiXSk6"
+    "CiAgICAgICAgICAgICAgICByID0gc3VicHJvY2Vzcy5ydW4oWyJ1bW91bnQiLCBtWyJsb2NhbCJdXSwgY2FwdHVyZV9vdXRwdXQ9"
+    "VHJ1ZSwgdGV4dD1UcnVlKQogICAgICAgICAgICAgICAgaWYgci5yZXR1cm5jb2RlICE9IDA6CiAgICAgICAgICAgICAgICAgICAg"
+    "bG9nZihmJ3dhcm46IHVtb3VudCB7bVsibG9jYWwiXX06IHtyLnJldHVybmNvZGV9OiB7KHIuc3Rkb3V0ICsgci5zdGRlcnIpLnN0"
+    "cmlwKCl9JykKICAgICAgICAgICAgICAgIGVsc2U6CiAgICAgICAgICAgICAgICAgICAgbG9nZihmJ3VubW91bnRlZCB7bVsibG9j"
+    "YWwiXX0nKQogICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICBwYXNzCiAgICBsb2dmKCJ1bmluc3RhbGxlZCIpCiAgICByZXR1"
+    "cm4gMAoKCmRlZiB1c2FnZSgpOgogICAgcHJpbnQoIiIibmFzLWVucC1tb3VudAogIChubyBhcmdzKSAvIC0tb25lc2hvdCAgIG1v"
+    "dW50IGFsbCBzaGFyZXMgb25jZSAod2l0aCBpbnRlcm5hbCByZXRyaWVzKQogIC0taW5zdGFsbC1zZXJ2aWNlICAgICAgIGluc3Rh"
+    "bGwgJiBlbmFibGUgc3lzdGVtZCBib290IHNlcnZpY2UKICAtLXVuaW5zdGFsbCAgICAgICAgICAgICBzdG9wIHNlcnZpY2UsIHJl"
+    "bW92ZSB1bml0LCB1bm1vdW50IHNoYXJlcwogIC0tc3RhdHVzICAgICAgICAgICAgICAgIHNob3cgbW91bnQgc3RhdHVzCiAgLS1z"
+    "ZWxmdGVzdCAgICAgICAgICAgICAgdmVyaWZ5IGVtYmVkZGVkIGNvbmZpZyBkZWNyeXB0cyAobm8gc2VjcmV0cyBwcmludGVkKSIi"
+    "IikKCgpkZWYgbWFpbigpOgogICAgbW9kZSA9IHN5cy5hcmd2WzFdIGlmIGxlbihzeXMuYXJndikgPiAxIGVsc2UgIi0tb25lc2hv"
+    "dCIKICAgIGlmIG1vZGUgaW4gKCItLW9uZXNob3QiLCAiIik6CiAgICAgICAgc3lzLmV4aXQob25lc2hvdCgpKQogICAgZWxpZiBt"
+    "b2RlID09ICItLWluc3RhbGwtc2VydmljZSI6CiAgICAgICAgc3lzLmV4aXQoaW5zdGFsbF9zZXJ2aWNlKCkpCiAgICBlbGlmIG1v"
+    "ZGUgPT0gIi0tdW5pbnN0YWxsIjoKICAgICAgICBzeXMuZXhpdCh1bmluc3RhbGwoKSkKICAgIGVsaWYgbW9kZSA9PSAiLS1zdGF0"
+    "dXMiOgogICAgICAgIHN5cy5leGl0KHN0YXR1cygpKQogICAgZWxpZiBtb2RlID09ICItLXNlbGZ0ZXN0IjoKICAgICAgICBzeXMu"
+    "ZXhpdChzZWxmdGVzdCgpKQogICAgZWxpZiBtb2RlIGluICgiLWgiLCAiLS1oZWxwIiwgImhlbHAiKToKICAgICAgICB1c2FnZSgp"
+    "CiAgICBlbHNlOgogICAgICAgIHVzYWdlKCkKICAgICAgICBzeXMuZXhpdCgyKQoKCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6"
+    "CiAgICBtYWluKCkK"
+)
 
-def go_template() -> str:
-    return base64.b64decode("".join(GO_TEMPLATE_B64)).decode()
+def py_client_template() -> str:
+    return base64.b64decode("".join(PY_CLIENT_TEMPLATE_B64)).decode()
 
 # ------------------------------------------------------------------ collect
 def prompt_config() -> dict:
@@ -259,66 +272,241 @@ def encrypt_config(cfg: dict) -> dict:
     return {"cipher": b(ct), "nonce": b(nonce), "keya": b(key_a), "keypad": b(pad)}
 
 def fill_template(blob: dict) -> str:
-    return (go_template()
+    return (py_client_template()
             .replace("__CIPHERTEXT__", blob["cipher"])
             .replace("__NONCE__", blob["nonce"])
             .replace("__KEYA__", blob["keya"])
             .replace("__KEYPAD__", blob["keypad"]))
 
-# ------------------------------------------------------------------ build
-def build(src: str, arches, out_base: str, do_build: bool):
-    out_base = os.path.abspath(out_base)
-    workdir = tempfile.mkdtemp(prefix="nasenp-")
-    with open(os.path.join(workdir, "main.go"), "w") as f:
-        f.write(src)
+def deploy_instructions(out_path: str) -> str:
+    name = os.path.basename(out_path)
+    return (
+        "Deploy on each Linux client (as root):\n"
+        "  mkdir -p /root/nas-enp-mount\n"
+        f"  cp {name} /root/nas-enp-mount/\n"
+        f"  python3 /root/nas-enp-mount/{name} --selftest         # sanity check\n"
+        f"  python3 /root/nas-enp-mount/{name} --install-service  # enable at boot\n"
+        "\nReminder: use a dedicated, least-privilege, revocable NAS account."
+    )
 
-    if not do_build:
-        dst = out_base + ".go"
-        shutil.copy(os.path.join(workdir, "main.go"), dst)
-        print(f"\n[emit] Go source written to: {dst}")
-        print("Compile on any Linux box with:")
-        print(f"  cd <dir> && go mod init nasenpmount && "
-              f"CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o nas-enp-mount .")
+# ------------------------------------------------------------------ gui
+def _pip_install(pkg: str):
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", pkg],
+                        capture_output=True, text=True)
+    if r.returncode != 0:
+        # pip module may be missing entirely on a minimal image; bootstrap it once.
+        subprocess.run([sys.executable, "-m", "ensurepip", "--default-pip"],
+                        capture_output=True, text=True)
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", pkg],
+                            capture_output=True, text=True)
+    return r
+
+def ensure_pyside6():
+    try:
+        import PySide6  # noqa: F401
         return
-
-    if not shutil.which("go"):
-        sys.exit("Go toolchain not found. Install Go, or re-run with --no-build.")
-
-    subprocess.run(["go", "mod", "init", "nasenpmount"], cwd=workdir,
-                   check=True, capture_output=True)
-
-    outputs = []
-    for arch in arches:
-        out = out_base if len(arches) == 1 else f"{out_base}-{arch}"
-        env = dict(os.environ, GOOS="linux", GOARCH=arch,
-                   CGO_ENABLED="0", GOFLAGS="-mod=mod")
-        r = subprocess.run(
-            ["go", "build", "-trimpath", "-ldflags", "-s -w", "-o", out, "."],
-            cwd=workdir, env=env, capture_output=True, text=True)
+    except ImportError:
+        sys.stderr.write("PySide6 missing; installing via pip ...\n")
+        r = _pip_install("PySide6")
         if r.returncode != 0:
-            sys.exit(f"build failed for {arch}:\n{r.stderr}")
-        os.chmod(out, 0o700)
-        outputs.append(out)
-        print(f"[ok] built linux/{arch}: {out}")
-    return outputs
+            sys.exit(f"Missing dependency. Run:  pip install PySide6\n{r.stdout}{r.stderr}")
+        try:
+            import PySide6  # noqa: F401
+        except ImportError:
+            sys.exit("PySide6 still not importable after install.")
+
+def launch_gui():
+    ensure_pyside6()
+    from PySide6.QtWidgets import (
+        QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit,
+        QComboBox, QCheckBox, QSpinBox, QPushButton, QLabel, QMessageBox,
+        QPlainTextEdit, QDialog,
+    )
+
+    class MountRow(QWidget):
+        def __init__(self, on_remove):
+            super().__init__()
+            layout = QHBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.remote = QLineEdit()
+            self.remote.setPlaceholderText("remote path on NAS")
+            self.local = QLineEdit()
+            self.local.setPlaceholderText("local mount point")
+            self.options = QLineEdit()
+            self.options.setPlaceholderText("per-mount options (optional)")
+            remove_btn = QPushButton("Remove")
+            remove_btn.clicked.connect(lambda: on_remove(self))
+            for w in (self.remote, self.local, self.options, remove_btn):
+                layout.addWidget(w)
+
+        def to_dict(self):
+            return {"remote": self.remote.text().strip(),
+                    "local": self.local.text().strip(),
+                    "options": self.options.text().strip()}
+
+    class GeneratorWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("nas-enp-mount generator")
+            self.mount_rows = []
+
+            root = QVBoxLayout(self)
+            form = QFormLayout()
+
+            self.protocol = QComboBox()
+            self.protocol.addItems(["cifs", "nfs"])
+            self.protocol.currentTextChanged.connect(self._on_protocol_changed)
+            form.addRow("Protocol:", self.protocol)
+
+            self.host = QLineEdit()
+            form.addRow("NAS host/IP:", self.host)
+
+            self.username = QLineEdit()
+            form.addRow("Username:", self.username)
+
+            self.password = QLineEdit()
+            self.password.setEchoMode(QLineEdit.Password)
+            form.addRow("Password:", self.password)
+
+            self.domain = QLineEdit()
+            form.addRow("Domain (optional):", self.domain)
+
+            self.default_options = QLineEdit()
+            form.addRow("Default mount options:", self.default_options)
+
+            root.addLayout(form)
+            root.addWidget(QLabel("Mounts:"))
+            self.mounts_box = QVBoxLayout()
+            root.addLayout(self.mounts_box)
+            add_mount_btn = QPushButton("Add mount")
+            add_mount_btn.clicked.connect(self._add_mount_row)
+            root.addWidget(add_mount_btn)
+
+            form2 = QFormLayout()
+            self.retry_attempts = QSpinBox()
+            self.retry_attempts.setRange(1, 100)
+            self.retry_attempts.setValue(5)
+            form2.addRow("Retry attempts:", self.retry_attempts)
+
+            self.retry_delay = QSpinBox()
+            self.retry_delay.setRange(1, 3600)
+            self.retry_delay.setValue(5)
+            form2.addRow("Retry delay (sec):", self.retry_delay)
+
+            self.install_deps = QCheckBox("Auto-install cifs-utils if missing")
+            self.install_deps.setChecked(True)
+            form2.addRow(self.install_deps)
+
+            self.out_path = QLineEdit("nas-enp-mount.py")
+            form2.addRow("Output path:", self.out_path)
+
+            self.save_config_path = QLineEdit()
+            self.save_config_path.setPlaceholderText("(optional) also save config JSON to ...")
+            form2.addRow("Save config to:", self.save_config_path)
+
+            root.addLayout(form2)
+
+            gen_btn = QPushButton("Generate")
+            gen_btn.clicked.connect(self._on_generate)
+            root.addWidget(gen_btn)
+
+            self._on_protocol_changed(self.protocol.currentText())
+            self._add_mount_row()
+
+        def _on_protocol_changed(self, protocol):
+            if protocol == "cifs":
+                self.default_options.setText(
+                    "vers=3.0,iocharset=utf8,uid=0,gid=0,file_mode=0644,dir_mode=0755")
+            else:
+                self.default_options.setText("vers=4,soft,timeo=50,retrans=3")
+
+        def _add_mount_row(self):
+            row = MountRow(self._remove_mount_row)
+            self.mount_rows.append(row)
+            self.mounts_box.addWidget(row)
+
+        def _remove_mount_row(self, row):
+            if len(self.mount_rows) <= 1:
+                return
+            self.mount_rows.remove(row)
+            row.setParent(None)
+            row.deleteLater()
+
+        def _collect_config(self):
+            mounts = [r.to_dict() for r in self.mount_rows]
+            mounts = [m for m in mounts if m["remote"] and m["local"]]
+            return {
+                "protocol": self.protocol.currentText(),
+                "host": self.host.text().strip(),
+                "username": self.username.text().strip(),
+                "password": self.password.text(),
+                "domain": self.domain.text().strip(),
+                "default_options": self.default_options.text().strip(),
+                "mounts": mounts,
+                "retry_attempts": self.retry_attempts.value(),
+                "retry_delay_sec": self.retry_delay.value(),
+                "install_deps": self.install_deps.isChecked(),
+            }
+
+        def _on_generate(self):
+            cfg = self._collect_config()
+            try:
+                validate(cfg)
+            except SystemExit as e:
+                QMessageBox.critical(self, "Invalid configuration", str(e))
+                return
+
+            out_path = self.out_path.text().strip() or "nas-enp-mount.py"
+            save_path = self.save_config_path.text().strip()
+            if save_path:
+                with open(save_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                os.chmod(save_path, 0o600)
+
+            blob = encrypt_config(cfg)
+            src = fill_template(blob)
+            out_abs = os.path.abspath(out_path)
+            with open(out_abs, "w") as f:
+                f.write(src)
+            os.chmod(out_abs, 0o700)
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Done")
+            layout = QVBoxLayout(dlg)
+            text = QPlainTextEdit(f"Client script written to: {out_abs}\n\n" + deploy_instructions(out_abs))
+            text.setReadOnly(True)
+            layout.addWidget(text)
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dlg.accept)
+            layout.addWidget(close_btn)
+            dlg.resize(600, 400)
+            dlg.exec()
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    win = GeneratorWindow()
+    win.resize(700, 550)
+    win.show()
+    app.exec()
 
 # ------------------------------------------------------------------ main
 def main():
-    ap = argparse.ArgumentParser(description="Generate an encrypted NAS auto-mount client binary.")
-    ap.add_argument("--config", help="JSON config file (skips interactive prompts)")
-    ap.add_argument("--arch", default="amd64",
-                    help="comma-separated Go arches: amd64,arm64,arm,386 (default amd64)")
-    ap.add_argument("--out", default="nas-enp-mount", help="output binary path/name")
-    ap.add_argument("--no-build", action="store_true", help="emit Go source instead of compiling")
+    ap = argparse.ArgumentParser(description="Generate an encrypted NAS auto-mount client script.")
+    ap.add_argument("--config", help="JSON config file (skips interactive prompts / GUI)")
+    ap.add_argument("--cli", action="store_true", help="use terminal prompts instead of the GUI")
+    ap.add_argument("--out", default="nas-enp-mount.py", help="output client script path")
     ap.add_argument("--save-config", help="write the collected config to this JSON file (contains the PASSWORD in cleartext, guard it)")
     args = ap.parse_args()
 
     if args.config:
         with open(args.config) as f:
             cfg = json.load(f)
-    else:
+        validate(cfg)
+    elif args.cli:
         cfg = prompt_config()
-    validate(cfg)
+        validate(cfg)
+    else:
+        launch_gui()
+        return
 
     if args.save_config:
         with open(args.save_config, "w") as f:
@@ -328,15 +516,13 @@ def main():
 
     blob = encrypt_config(cfg)
     src = fill_template(blob)
-    arches = [a.strip() for a in args.arch.split(",") if a.strip()]
-    build(src, arches, args.out, not args.no_build)
+    out_abs = os.path.abspath(args.out)
+    with open(out_abs, "w") as f:
+        f.write(src)
+    os.chmod(out_abs, 0o700)
 
-    print("\nDeploy on each Linux client (as root):")
-    print("  mkdir -p /root/nas-enp-mount")
-    print("  cp nas-enp-mount /root/nas-enp-mount/")
-    print("  /root/nas-enp-mount/nas-enp-mount --selftest         # sanity check")
-    print("  /root/nas-enp-mount/nas-enp-mount --install-service  # enable at boot")
-    print("\nReminder: use a dedicated, least-privilege, revocable NAS account.")
+    print(f"\n[emit] Client script written to: {out_abs}")
+    print(deploy_instructions(out_abs))
 
 if __name__ == "__main__":
     main()
