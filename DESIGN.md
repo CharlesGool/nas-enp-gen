@@ -28,14 +28,14 @@ nas-enp-gen.py                      nas-enp-gen.py --config config.json
         |                              terminal prompts)
         |  1. validates config
         |  2. AES-256-GCM encrypts the JSON blob
-        |  3. splits/XOR-obfuscates the key, fills it into the Python client template
-        |  4. writes the filled template to disk — no build/compile step
+        |  3. splits/XOR-obfuscates the key, fills it into the Go client template
+        |  4. `go build` (or emits .go source with --no-build / the GUI checkbox)
         v
-nas-enp-mount.py (plain Python script, embeds ciphertext + obfuscated key)
+nas-enp-mount (per-arch static binary, embeds ciphertext + obfuscated key)
         |
-        |  copied to each client, run as root (python3 nas-enp-mount.py ...)
+        |  copied to each client, run as root
         v
-client script
+client binary
         |  --selftest      decrypt in memory, verify, print nothing sensitive
         |  --oneshot        mount each configured share (idempotent, retries)
         |  --install-service  write systemd unit, enable, start
@@ -46,7 +46,7 @@ mounted CIFS/NFS shares on the client
 The generator itself is also packaged as installable `.deb` (Linux) and `.exe`
 (Windows) desktop apps — see "Packaging & CI" below — for people who'd rather
 double-click a form than run a CLI. The deployed mount client is never
-packaged this way; it stays a plain script driven by systemd, with no GUI.
+packaged this way; it stays a plain static binary driven by systemd, with no GUI.
 
 ## Tech stack
 
@@ -56,8 +56,8 @@ packaged this way; it stays a plain script driven by systemd, with no GUI.
 | Generator crypto | `cryptography` (pyca) | 3.4.8 | Audited, standard choice for AES-256-GCM in Python |
 | Generator GUI | PySide6 (Qt for Python) | latest | LGPLv3 — compatible with staying permissively (Apache-2.0) licensed, unlike GPL/commercial PyQt. See `DECISIONS.md` 2026-08-16. |
 | Generator packaging | PyInstaller + `dpkg-deb` (Linux), PyInstaller (Windows, via CI) | latest | Single-file executables wrapped into installers; Windows build runs on GitHub Actions `windows-latest` since this project has no local Windows environment |
-| Client | Python | 3.8+ | All deployment targets guarantee a Python environment (confirmed by user); removes the Go-toolchain requirement entirely. See `DECISIONS.md` 2026-08-16. |
-| Client crypto | `cryptography` (pyca) | same as generator | Same library, same AES-256-GCM scheme, on both sides — one dependency to track instead of two toolchains |
+| Client | Go | any toolchain from go.dev | Compiles to a single static, stripped binary — no runtime deps on the client, small attack surface, cross-compiles trivially. Reverted from a pure-Python client (2026-08-16, same day) after real deployment testing showed a plaintext `.py` client is too easy to inspect/de-obfuscate; a PyInstaller-repackaged Python client was considered and rejected as not meaningfully more opaque. See `DECISIONS.md` 2026-08-16 (both entries). |
+| Client crypto | Go stdlib `crypto/aes`, `crypto/cipher` | stdlib | No third-party Go modules — nothing to vendor or license-track |
 
 Rejected alternatives and reasoning live in `DECISIONS.md`.
 
@@ -74,9 +74,10 @@ Rejected alternatives and reasoning live in `DECISIONS.md`.
 ### Environment
 
 - OS (generator machine): any OS with Python 3.8+ — Linux, Windows, or macOS. GUI mode needs a display; `--config`/`--cli` modes don't.
-- OS (client machine): Debian/Ubuntu Linux, root access, Python 3.8+
-- Runtime + version: Python 3.8+, `cryptography` package (both generator and client; auto-installed via `pip` if missing on either side)
-- Optional (dev/CI only, not needed to run the project): PyInstaller + `dpkg-deb` to build the `.deb` installer locally; GitHub Actions `windows-latest` runner builds the `.exe`
+- OS (client machine): Debian/Ubuntu Linux, root access
+- Runtime + version: Python 3.8+ with `cryptography` on the generator machine
+- Go toolchain (https://go.dev/dl/) on the generator machine to compile, OR use `--no-build` (CLI) / the "emit Go source only" checkbox (GUI) to emit `.go` source and compile on any Linux box instead
+- Optional (dev/CI only, not needed to run the project): PyInstaller + `dpkg-deb` to build the generator's `.deb` installer locally; GitHub Actions `windows-latest` runner builds the generator's `.exe`
 - Dependency restore command: `pip install -r requirements.txt`
 
 ### External dependencies
@@ -84,8 +85,8 @@ Rejected alternatives and reasoning live in `DECISIONS.md`.
 | Item | Source | Placed at |
 |---|---|---|
 | NAS credentials (host/user/password) | your NAS admin panel | `config.json` (gitignored, never committed) |
-| `cifs-utils` (client, optional) | client's package manager | auto-installed by the client script when `install_deps: true` |
-| `cryptography` (client) | PyPI | auto-installed via `pip` on client first run if missing |
+| Go toolchain | https://go.dev/dl/ | system `PATH` on the generator machine (not needed on clients — the output is a static binary) |
+| `cifs-utils` (client, optional) | client's package manager | auto-installed by the client binary when `install_deps: true` |
 
 Use placeholders, never real values, in anything committed — see `config.example.json`.
 
@@ -97,7 +98,7 @@ Every path below is *supplied by the user's own `config.json`*, not hardcoded in
 |---|---|---|
 | `mounts[].remote` | user, in config | path on the NAS to mount |
 | `mounts[].local` | user, in config | mount point on the client |
-| `--out` | CLI flag, default `nas-enp-mount.py` | where the generator writes the filled client script |
+| `--out` | CLI flag, default `nas-enp-mount` | where the generator writes the built binary (or `.go` source with `--no-build`) |
 
 The client hardcodes its own install location, `/root/nas-enp-mount`, as a fixed convention documented in the README — this is a client-side install path, not a generator-machine path, so it does not need to be templated.
 
@@ -118,14 +119,14 @@ Fields of the JSON config consumed by `nas-enp-gen.py --config <file>` (see `con
 | `retry_delay_sec` | seconds between retries | — | yes |
 | `install_deps` | let the client `apt install cifs-utils` if missing | — | yes |
 
-CLI flags of the generator itself: `--config` (headless/scripted), `--cli` (force the old terminal-prompt flow instead of the GUI), `--out`, `--save-config` (writes the collected config back out — contains the password in cleartext, guard it). No arguments launches the PySide6 GUI. `--arch` and `--no-build` were removed — there is no build/compile step anymore.
+CLI flags of the generator itself: `--config` (headless/scripted), `--cli` (force the old terminal-prompt flow instead of the GUI), `--arch` (comma-separated Go arches, default `amd64`), `--out`, `--no-build` (emit `.go` source instead of compiling), `--save-config` (writes the collected config back out — contains the password in cleartext, guard it). No arguments launches the PySide6 GUI, which has equivalent controls (an arch field, an "emit Go source only" checkbox).
 
 ## Setup from scratch
 
-1. On the generator machine: `pip install -r requirements.txt` — verify: `python3 -c "import cryptography, PySide6"` prints nothing / no error.
+1. On the generator machine: `pip install -r requirements.txt` — verify: `python3 -c "import cryptography, PySide6"` prints nothing / no error. Also install a Go toolchain (or plan to use `--no-build`).
 2. Copy `config.example.json` to `config.json`, fill in real NAS details — verify: `python3 -m json.tool config.json` parses without error.
-3. Run `python3 nas-enp-gen.py --config config.json` (or launch the GUI with no args and fill the form) — verify: a `nas-enp-mount.py` script appears in the working directory.
-4. Copy the script to a test client, run `python3 nas-enp-mount.py --selftest` — verify: it reports the config decrypted successfully (auto-installs `cryptography` on the client if missing).
+3. Run `python3 nas-enp-gen.py --config config.json` (or launch the GUI with no args and fill the form) — verify: a `nas-enp-mount` binary appears in the working directory.
+4. Copy the binary to a test client, run `--selftest` — verify: it reports the config decrypted successfully.
 5. Run `--oneshot` on the client — verify: `mount | grep <local path>` shows the share mounted.
 6. Run `--install-service` — verify: `systemctl is-enabled nas-enp-mount.service` reports `enabled`.
 
@@ -143,21 +144,22 @@ repo/
 │   └── build-deb.sh         # local .deb build (control file + dpkg-deb)
 ├── .github/workflows/
 │   └── release-installers.yml  # CI: builds .deb (ubuntu-latest) + .exe (windows-latest) on tag push
-└── (config.json, nas-enp-mount.py, dist/ — generator/build outputs, all gitignored)
+└── (config.json, nas-enp-mount, *.go, dist/ — generator/build outputs, all gitignored)
 ```
 
-The Python client source lives base64-embedded inside `nas-enp-gen.py` (`PY_CLIENT_TEMPLATE_B64`), so the generator stays single-file and self-contained. There is no `--no-build`-equivalent flag needed for inspection — the filled script written to `--out` *is* the real source, plaintext, readable directly.
+The Go client source lives base64-embedded inside `nas-enp-gen.py` (`GO_TEMPLATE_B64`) rather than as a separate `.go` file, so the generator is single-file and self-contained. Use `--no-build` (or the GUI's "emit Go source only" checkbox) to dump the real `.go` source for inspection.
 
 ## Known limitations & gotchas
 
 - `config.example.json` previously held **real production credentials** committed under an "example" filename — this has been corrected (placeholders only, see `DECISIONS.md` 2026-08-16). Real values now live in a gitignored `config.json` outside version control, and the actual working config used on this host is kept at `../nas.local.json` (project root, outside `repo/`, never committed).
-- Security is obfuscation, not encryption-that-matters against a root-privileged attacker on the client — see README. Moving the client from a compiled binary to a plaintext-readable `.py` script (2026-08-16) makes casual inspection slightly easier than before; this was never relied upon as real secrecy.
-- No automated tests exist yet for the generator or the client template.
-- The `.exe` installer is built exclusively by GitHub Actions CI (`windows-latest`) — this project has no Windows development environment, so that build path is unverified until a real tag triggers it.
-- The GUI's interactive behavior (widget layout, form validation feedback) has only been smoke-tested headless (`QT_QPA_PLATFORM=offscreen`) — it has not been visually verified on a real display.
+- Security is obfuscation, not encryption-that-matters against a root-privileged attacker on the client — see README.
+- No automated tests exist yet for the generator or the embedded Go client.
+- The `.exe` **generator** installer is built exclusively by GitHub Actions CI (`windows-latest`) — this project has no Windows development environment, so that build path is unverified until a real tag triggers it. (This is separate from the client binary, which compiles fine on this Linux dev host — see below.)
+- The GUI's interactive behavior has been visually verified by the user on a real Windows display for the base form; the bilingual language switcher and the new arch/emit-source controls added afterward have only been smoke-tested headless (`QT_QPA_PLATFORM=offscreen`) here, not yet re-confirmed visually.
+- The **real `go build` path is now verified** on this dev host (Go 1.18 via `apt-get install golang-go`): single-arch build, multi-arch cross-compile (`amd64,arm64`), and `--no-build` source emission were all exercised end-to-end, producing a stripped static ELF binary whose `--selftest`/`--help` both work correctly. Not yet verified: building on a non-Debian/Ubuntu generator OS, or arches beyond amd64/arm64.
 
 ## How to extend
 
-- New client platforms beyond Debian/Ubuntu: the Python client template would need OS-specific mount logic (this one shells out to `mount.cifs`/`mount -t nfs`, both Linux-specific); Windows/macOS clients are an explicit non-goal for now.
-- New mount protocols beyond CIFS/NFS: extend the config schema and validation in both the Python client template and `validate()` in `nas-enp-gen.py` together — they must stay in sync since there is no shared schema.
+- New client platforms: the Go template in `GO_TEMPLATE_B64` would need a second variant; consider externalizing it to a real `.go` file with build tags before doing this — the base64-blob-in-Python approach does not scale past one target OS.
+- New mount protocols beyond CIFS/NFS: extend `MountSpec`/`Config` in the Go template and `validate()` in `nas-enp-gen.py` together — they must stay in sync since there is no shared schema.
 - New generator platforms for the packaged installer (e.g. macOS `.dmg`): add a third GitHub Actions job on `macos-latest` following the same PyInstaller pattern as the `.exe` job.

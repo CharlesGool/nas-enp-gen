@@ -6,8 +6,8 @@ A two-part tool for auto-mounting NAS shares on Linux clients without leaving th
 
 ## What it does
 
-- **`nas-enp-gen.py`** (the *generator*, runs on your workstation) — takes NAS connection details and mount mappings, AES-256-GCM encrypts them, and writes a self-contained Python client script that embeds the ciphertext. Run it with no arguments for a **GUI form** (PySide6, switchable **English / 中文** via the language dropdown in the top-left corner — defaults to your system locale), or `--config`/`--cli` for headless/scripted use. Also shipped as installable **`.deb`** (Linux) and **`.exe`** (Windows) desktop apps — see Install.
-- **The generated script** (the *client*) — drop it on each Linux box (Debian/Ubuntu), run as root with `python3`; it mounts the configured shares and can install itself as a systemd boot service.
+- **`nas-enp-gen.py`** (the *generator*, runs on your workstation) — takes NAS connection details and mount mappings, AES-256-GCM encrypts them, and compiles a single stripped static Go binary that embeds the ciphertext. Run it with no arguments for a **GUI form** (PySide6, switchable **English / 中文** via the language dropdown in the top-left corner — defaults to your system locale), or `--config`/`--cli` for headless/scripted use. Also shipped as installable **`.deb`** (Linux) and **`.exe`** (Windows) desktop apps — see Install.
+- **The generated binary** (the *client*) — drop it on each Linux box (Debian/Ubuntu), run as root; it mounts the configured shares and can install itself as a systemd boot service. No runtime dependencies — it's a static binary.
 
 Non-goals: this does not make credentials unrecoverable on a client that has root access — see the security note below. It is not a general-purpose secrets manager.
 
@@ -15,15 +15,15 @@ Non-goals: this does not make credentials unrecoverable on a client that has roo
 
 The goal "the credentials can't be reverse-engineered on the client" **cannot be fully achieved** — any client able to mount the share must present the credentials, so a root user on that client can always recover them (RAM dump, `strace` on the mount, packet capture of the SMB auth). What this tool actually does:
 
-- Credentials are **AES-256-GCM encrypted** and embedded in the client script; the key is split/XOR-obfuscated. No plaintext config file is ever written to the client disk.
-- That's **obfuscation, not unbreakable secrecy** — it stops casual inspection and accidental leakage, and raises the bar for a determined attacker. Since the client is a plain, readable `.py` file rather than a compiled binary, that bar is a bit lower than a stripped executable would be — see `DECISIONS.md`.
+- Credentials are **AES-256-GCM encrypted** and embedded in the client binary; the key is split/XOR-obfuscated. No plaintext config file is ever written to the client disk, and `strings` on the binary reveals nothing but base64 ciphertext.
+- That's **obfuscation, not unbreakable secrecy** — it stops casual inspection and accidental leakage, and raises the bar for a determined attacker. The client is a stripped, compiled Go binary rather than a script, which keeps that bar meaningfully higher than plaintext source would — see `DECISIONS.md` for why this was worth reverting a same-day pure-Python experiment.
 
 **Do this too:** create a **dedicated, least-privilege (read-only where possible), revocable** account on the NAS for these clients. If it ever leaks, the damage is contained and you kill it by changing one password on the NAS.
 
 ## Requirements
 
-- OS / runtime (generator machine): Python 3.8+ with `cryptography` (GUI also needs `PySide6`, auto-installed via pip on first GUI launch if missing) — or just use the packaged `.deb`/`.exe`, which bundle everything.
-- Client machine: Debian/Ubuntu Linux, root access, Python 3.8+. `cryptography` and `cifs-utils` are both auto-installed by the client script on first run if missing.
+- OS / runtime (generator machine): Python 3.8+ with `cryptography` (GUI also needs `PySide6`, auto-installed via pip on first GUI launch if missing), plus a Go toolchain to compile the client (or use `--no-build`/the GUI's "emit Go source only" checkbox to skip this and compile elsewhere) — or just use the packaged `.deb`/`.exe`, which bundle the generator's own Python/GUI deps (you still need Go, or `--no-build`, to produce a client).
+- Client machine: Debian/Ubuntu Linux, root access. No runtime dependencies — the binary is static.
 
 ## Install
 
@@ -38,6 +38,8 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.json config.json   # then fill in real NAS details, see Configuration
 ```
+
+**Note:** the `.deb`/`.exe` are installers for the *generator app* only — they're generic and safe to attach to a GitHub Release. The *client binary* (`nas-enp-mount`) is not: every copy embeds one specific user's own encrypted NAS credentials, so it can't be pre-built and published generically. Each user runs the generator themselves to produce their own client binary.
 
 ## Building the installers locally
 
@@ -64,16 +66,22 @@ python3 nas-enp-gen.py --config config.json
 # interactive terminal prompts instead of the GUI
 python3 nas-enp-gen.py --cli
 
+# cross-compile for multiple client architectures
+python3 nas-enp-gen.py --config config.json --arch amd64,arm64
+
+# no Go toolchain here? emit source instead, compile on any Linux box
+python3 nas-enp-gen.py --config config.json --no-build
+
 # custom output path
-python3 nas-enp-gen.py --config config.json --out nas-enp-mount.py
+python3 nas-enp-gen.py --config config.json --out nas-enp-mount
 ```
 
 ## Verify it works
 
-You should see a `nas-enp-mount.py` script written to the current directory (GUI mode shows the same info in a result dialog). Copy it to a test client and run `--selftest`:
+You should see a `nas-enp-mount` binary written to the current directory (GUI mode shows the same info in a result dialog). Copy it to a test client and run `--selftest`:
 
 ```bash
-python3 nas-enp-mount.py --selftest
+./nas-enp-mount --selftest
 ```
 
 Expect output confirming the embedded config decrypts successfully, with no secrets printed.
@@ -82,10 +90,11 @@ Expect output confirming the embedded config decrypts successfully, with no secr
 
 ```bash
 mkdir -p /root/nas-enp-mount
-cp nas-enp-mount.py /root/nas-enp-mount/
-python3 /root/nas-enp-mount/nas-enp-mount.py --selftest         # verify config decrypts
-python3 /root/nas-enp-mount/nas-enp-mount.py --oneshot          # mount now
-python3 /root/nas-enp-mount/nas-enp-mount.py --install-service  # enable at boot
+cp nas-enp-mount /root/nas-enp-mount/
+chmod +x /root/nas-enp-mount/nas-enp-mount
+/root/nas-enp-mount/nas-enp-mount --selftest         # verify config decrypts
+/root/nas-enp-mount/nas-enp-mount --oneshot          # mount now
+/root/nas-enp-mount/nas-enp-mount --install-service  # enable at boot
 ```
 
 Client modes:
@@ -109,7 +118,7 @@ Check logs any time with: `journalctl -u nas-enp-mount.service`
 
 ## Rotating credentials / changing the NAS
 
-The credentials live only inside the script. When the NAS IP or password changes, re-run the generator to produce a new script and copy it over (`--uninstall` first if you want a clean swap). There is no editable config on the client to get out of sync.
+The credentials live only inside the binary. When the NAS IP or password changes, re-run the generator to produce a new binary and copy it over (`--uninstall` first if you want a clean swap). There is no editable config on the client to get out of sync.
 
 ## Configuration
 
