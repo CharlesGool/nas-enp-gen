@@ -103,4 +103,4 @@ See `config.example.json` for the full shape. Full reference: see `DESIGN.md` �
 
 ## License
 
-Private project — all rights reserved. Not currently distributed.
+Apache License 2.0 — see `LICENSE`.

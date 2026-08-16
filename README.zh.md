@@ -105,4 +105,4 @@ cp nas-enp-mount /root/nas-enp-mount/
 
 ## 许可
 
-私有项目，保留所有权利，目前不对外分发。
+Apache License 2.0 —— 见 `LICENSE`。
