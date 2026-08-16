@@ -8,6 +8,13 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-16 — Fix `--no-build` requiring a Go toolchain
+
+- **Context:** `build()` in `nas-enp-gen.py` called `subprocess.run(["go", "mod", "init", ...])` unconditionally before the `if not do_build: return` branch, so the documented no-Go-toolchain path (`--no-build`) still required the `go` binary and failed with `FileNotFoundError` when it was missing. Verified on this host (no Go toolchain installed) both before and after the fix.
+- **Decision:** Moved the `go mod init` call to after the `--no-build` early return, immediately before the actual `go build` loop where it's needed. `--no-build` now only writes `main.go` and prints manual compile instructions — no `go` binary required. Re-verified with `python3 nas-enp-gen.py --config config.example.json --no-build` on this Go-less host: succeeds.
+- **Rejected:** Installing a Go toolchain on this host instead of fixing the code — rejected because that would only verify the primary build path, not fix `--no-build` for the users it's actually meant to serve (people without Go).
+- **Consequences:** `--no-build` no longer needs Go on the generating machine. The primary `go build` path (non-`--no-build`) is still unverified on this host and remains a blocker for `v0.1.0` (see `STATUS.md`).
+
 ## 2026-08-16 — Normalize project to full-tier structure
 
 - **Context:** Project existed as a flat folder (`nas-enp-gen.py`, `README.md`, empty `Design.md`, `config.example.json`, a prebuilt `nas-enp-mount` binary) with no `repo/`/`snapshots/` split, no git repo, no `.gitignore`, no lockfile. It has real config/secrets and is meant to be deployed to other machines, so it qualifies for full-tier per the project-management skill.

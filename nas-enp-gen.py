@@ -271,8 +271,6 @@ def build(src: str, arches, out_base: str, do_build: bool):
     workdir = tempfile.mkdtemp(prefix="nasenp-")
     with open(os.path.join(workdir, "main.go"), "w") as f:
         f.write(src)
-    subprocess.run(["go", "mod", "init", "nasenpmount"], cwd=workdir,
-                   check=True, capture_output=True)
 
     if not do_build:
         dst = out_base + ".go"
@@ -285,6 +283,9 @@ def build(src: str, arches, out_base: str, do_build: bool):
 
     if not shutil.which("go"):
         sys.exit("Go toolchain not found. Install Go, or re-run with --no-build.")
+
+    subprocess.run(["go", "mod", "init", "nasenpmount"], cwd=workdir,
+                   check=True, capture_output=True)
 
     outputs = []
     for arch in arches:
