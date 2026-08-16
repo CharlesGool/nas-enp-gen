@@ -8,6 +8,15 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-16 — Client language: final decision — pure Python, no Go, ever (in this project)
+
+- **Context:** Third reversal of the client's implementation language in one day. Sequence: Go → pure Python (usability: every deployment target has Python) → back to Go (user wanted binary opacity after testing the plain `.py` client) → considered bundling a full Go SDK into the Windows installer so the GUI could still produce compiled binaries without the user installing Go separately, but the SDK adds ~200-300MB and forces a self-extracting-installer packaging model instead of a single small `.exe`. When asked to weigh "how much security is actually lost by not using Go," the honest answer is: almost none. AES-256-GCM strength is identical either way; the real weak point (decryption key embedded in the same artifact as the ciphertext) is structural, required by the "no operator interaction at boot" goal, and exists equally in both the Go binary and the Python script. Go binary vs. Python source only changes how much casual-inspection friction there is (`strings`/disassembly vs. opening a text file) — it does not change what a motivated attacker with client root can recover, which the project's own "Honest security note" already says is unrecoverable-in-principle regardless of language.
+- **Decision:** The client is pure Python, permanently, for this project. No Go toolchain requirement anywhere, no Go SDK bundling, no `--arch`/`--no-build`/GUI arch-and-emit-source controls. `nas-enp-gen.py` is reverted (via `git revert` of the Go-restoration commit, not hand-retyped) to the pure-Python-client state, keeping the bilingual GUI and `.deb`/`.exe` generator packaging untouched throughout all three reversals.
+- **Rejected:** Bundling a full Go SDK into the Windows installer — rejected purely on installer-size grounds (~5-8x bigger) once it became clear the security benefit it would buy back is marginal, not structural. Keeping the compiled-Go client — superseded now that the actual security delta has been analyzed and found to be small; the earlier "revert to Go" decision was made before that analysis, based on an intuition ("py太容易被反混淆了") that turned out to overstate the real difference.
+- **Consequences:** **Do not revisit this again without a genuinely new constraint** (e.g., a real incident traced to client-script readability, not just discomfort with it). Continuing to flip this decision costs real engineering time for a difference this session's own analysis found to be marginal. Reinforce the actual mitigation that matters — a dedicated, least-privilege, revocable NAS account (README "Honest security note") — rather than the implementation language.
+
+---
+
 ## 2026-08-16 — Bilingual (English/中文) GUI
 
 - **Context:** User visually confirmed the PySide6 GUI runs correctly on a real Windows display (the first real, non-offscreen verification of it) and asked for Chinese-language support, "做成双语的" (make it bilingual), for the GUI itself — distinct from the project's existing docs bilingual convention (README/DESIGN already have English + `.zh.md` pairs).
