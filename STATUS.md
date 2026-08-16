@@ -3,7 +3,7 @@
 **Version:** v0.1.1 (tagged and pushed) · **Branch:** main
 **Notion:** not yet synced
 **Repo:** https://github.com/CharlesGool/nas-enp-gen (public)
-**Snapshots:** maintained privately (not published) — v0.1.0 and v0.1.1 snapshots cut and verified
+**Snapshots:** maintained privately (not published) — v0.1.0 and v0.1.1 snapshots cut and verified (v0.1.1: 16/16 files, archive manifest matched)
 **In progress:** machine-fingerprint binding added in v0.1.0 (`binding.mode: "machine"` — see `DESIGN.md` "Envelope format", `DECISIONS.md` 2026-08-16 entries). v0.1.1 fixes a real deployment bug found immediately after v0.1.0 shipped: a machine-bound client generated on a non-UTF-8-locale Windows machine failed `SyntaxError: Non-UTF-8 code ...` on the target Linux client (see `CHANGELOG.md`). Client language remains **pure Python** (see `DECISIONS.md` 2026-08-16 "final decision" entry — do not revisit without a genuinely new constraint). Generator has a bilingual (English/中文) PySide6 GUI (kept `--config`/`--cli` for headless use, plus `--emit-collector`), packaged as `.deb`/`.exe` via PyInstaller + GitHub Actions CI.
 **Next:** revisit the Windows `.exe` build and GUI language-switcher visual confirmation below as post-release follow-ups — not release blockers. Consider syncing to Notion.
 **Known issues:**
