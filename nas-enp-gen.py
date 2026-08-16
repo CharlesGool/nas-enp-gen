@@ -32,7 +32,7 @@ binding.mode = "machine" derives the client's decryption key from each
 target machine's hardware fingerprint (see DESIGN.md "Envelope format")
 instead of embedding a recoverable key. A file leaked off its bound
 machine(s) is computationally useless. This does NOT protect against an
-attacker with root on a bound machine — see the security reality check
+attacker with root on a bound machine: see the security reality check
 above, which still applies in full on that machine.
 Collect fingerprints on each target first:  nas-enp-gen.py --emit-collector
 
@@ -101,7 +101,7 @@ def _fp_root_disk_serial():
 def collect_fingerprint():
     """Collect this machine's hardware fingerprint.
     Returns (fingerprint_hex, used[list[str]], skipped[list[str]]).
-    Raises SystemExit if product_uuid is unavailable or a placeholder —
+    Raises SystemExit if product_uuid is unavailable or a placeholder:
     this machine cannot be securely bound, and there is no lower-entropy
     fallback (see DESIGN.md 'Envelope format', entropy gate)."""
     if os.geteuid() != 0:
@@ -570,19 +570,19 @@ def self_check_no_leak(src: str, cfg: dict, out_path: str):
         sys.exit(
             f"FATAL: generation self-check found {len(hits)} plaintext/base64 "
             f"leak(s) in the written client script. Output deleted: {out_path}\n"
-            "This means the generator itself has a bug — do not ignore this."
+            "This means the generator itself has a bug: do not ignore this."
         )
 
 COLLECTOR_HEADER = '''\
 #!/usr/bin/env python3
 """
-nas-enp-fingerprint — standalone hardware fingerprint collector
+nas-enp-fingerprint - standalone hardware fingerprint collector
 
 Run as root on the TARGET machine before generating a machine-bound
 nas-enp-mount client. Prints a 64-hex-char fingerprint; paste it into
 nas-enp-gen's "binding.fingerprints" list (or the GUI's fingerprint box).
 
-Zero third-party dependencies — copy this single file anywhere and run it
+Zero third-party dependencies - copy this single file anywhere and run it
 with any Python 3. Contains no credentials and no NAS information.
 """
 import hashlib
@@ -608,7 +608,7 @@ if __name__ == "__main__":
 def emit_collector(out_path: str):
     src = COLLECTOR_HEADER + FINGERPRINT_LOGIC_SRC + COLLECTOR_MAIN
     out_abs = os.path.abspath(out_path)
-    with open(out_abs, "w", newline="\n") as f:
+    with open(out_abs, "w", newline="\n", encoding="utf-8") as f:
         f.write(src)
     os.chmod(out_abs, 0o755)
     print(f"[emit] Fingerprint collector written to: {out_abs}")
@@ -1018,13 +1018,13 @@ def launch_gui():
             out_path = self.out_path.text().strip() or "nas-enp-mount.py"
             save_path = self.save_config_path.text().strip()
             if save_path:
-                with open(save_path, "w") as f:
+                with open(save_path, "w", encoding="utf-8") as f:
                     json.dump(cfg, f, indent=2)
                 os.chmod(save_path, 0o600)
 
             src = fill_template(cfg)
             out_abs = os.path.abspath(out_path)
-            with open(out_abs, "w", newline="\n") as f:
+            with open(out_abs, "w", newline="\n", encoding="utf-8") as f:
                 f.write(src)
             os.chmod(out_abs, 0o700)
             try:
@@ -1079,14 +1079,14 @@ def main():
         return
 
     if args.save_config:
-        with open(args.save_config, "w") as f:
+        with open(args.save_config, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
         os.chmod(args.save_config, 0o600)
         print(f"[note] config saved to {args.save_config} (0600). It holds the cleartext password.")
 
     src = fill_template(cfg)
     out_abs = os.path.abspath(args.out)
-    with open(out_abs, "w", newline="\n") as f:
+    with open(out_abs, "w", newline="\n", encoding="utf-8") as f:
         f.write(src)
     os.chmod(out_abs, 0o700)
     self_check_no_leak(src, cfg, out_abs)

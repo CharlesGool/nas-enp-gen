@@ -4,6 +4,11 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.1.1 — fix invalid UTF-8 in generated scripts
+
+### Fixed
+- Generated client scripts and `--emit-collector` output could contain invalid UTF-8 bytes when generated on a machine whose default locale/codepage isn't UTF-8 (e.g. Windows with a non-English codepage). This happened because the generator wrote files via `open(path, "w")` with no explicit encoding, and one code comment contained a non-ASCII em dash. On the target machine, Python then refused to parse the script at all (`SyntaxError: Non-UTF-8 code ... but no encoding declared`). All file writes now specify `encoding="utf-8"` explicitly, and the stray non-ASCII character has been removed. Added a regression test (`tests/test_binding.py::test_generated_client_is_valid_utf8`).
+
 ## v0.1.0 — first release
 
 ### Added

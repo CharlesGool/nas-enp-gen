@@ -105,6 +105,28 @@ class TestBindingCryptoRoundTrip(unittest.TestCase):
         self.assertIn("slot match: FOUND", out)
         self.assertIn("config decrypted OK", out)
 
+    def test_generated_client_is_valid_utf8(self):
+        # Regression test: v0.1.0 wrote client/collector scripts via
+        # open(path, "w") with no explicit encoding, so on a generating
+        # machine whose default locale isn't UTF-8 (e.g. Windows with a
+        # non-English codepage), any non-ASCII character in the template
+        # got written using that locale's encoding instead -- producing a
+        # .py file that isn't valid UTF-8, which a target machine's Python
+        # then refuses to parse as source (fixed in v0.1.1: explicit
+        # encoding="utf-8" on every write, plus removed the one em dash
+        # that had been slipping through unnoticed).
+        cfg = base_cfg(binding={"mode": "machine", "fingerprints": [self.this_fp]})
+        path = self._write_client(cfg, "utf8check.py")
+        with open(path, "rb") as f:
+            raw = f.read()
+        raw.decode("utf-8")  # raises UnicodeDecodeError on regression
+
+        collector_path = os.path.join(self.tmpdir, "utf8check_collector.py")
+        gen.emit_collector(collector_path)
+        with open(collector_path, "rb") as f:
+            collector_raw = f.read()
+        collector_raw.decode("utf-8")
+
     def test_multi_slot_3_of_4(self):
         b, c, d = "b" * 64, "c" * 64, "d" * 64
         cfg = base_cfg(binding={"mode": "machine", "fingerprints": [self.this_fp, b, c]})
