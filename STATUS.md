@@ -1,11 +1,11 @@
 # Status — updated 2026-08-16
 
-**Version:** v0.1.0 (first release, about to be tagged) · **Branch:** main
+**Version:** v0.1.0 (tagged and pushed) · **Branch:** main
 **Notion:** not yet synced
 **Repo:** https://github.com/CharlesGool/nas-enp-gen (public)
-**Snapshots:** maintained privately (not published) — none yet, first snapshot is cut at v0.1.0
+**Snapshots:** maintained privately (not published) — v0.1.0 snapshot cut and verified (16/16 files, archive manifest matched)
 **In progress:** machine-fingerprint binding added (`binding.mode: "machine"` — see `DESIGN.md` "Envelope format", `DECISIONS.md` 2026-08-16 entries). Client language remains **pure Python** (see `DECISIONS.md` 2026-08-16 "final decision" entry — do not revisit without a genuinely new constraint). Generator has a bilingual (English/中文) PySide6 GUI (kept `--config`/`--cli` for headless use, plus new `--emit-collector`), packaged as `.deb`/`.exe` via PyInstaller + GitHub Actions CI.
-**Next:** tag `v0.1.0` (release checklist), then revisit the Windows `.exe` build and GUI language-switcher visual confirmation below as post-release follow-ups — no longer treated as release blockers, see decision below.
+**Next:** revisit the Windows `.exe` build and GUI language-switcher visual confirmation below as post-release follow-ups — no longer treated as release blockers, see decision below. Consider syncing to Notion.
 **Known issues:**
 - Automated tests exist for the machine-binding crypto (`tests/test_binding.py`, 14 cases covering guide section 8: cross-machine failure, multi-slot, tamper detection, entropy gate, no-plaintext-leak, KDF timing, legacy-mode compatibility). The generator's non-crypto paths (GUI widget behavior beyond smoke tests, packaging) still have no automated tests.
 - GUI's base form **has been visually verified on a real Windows display by the user**. The bilingual language-switching (language dropdown, live retranslate) and the new binding controls have only been offscreen/logic-tested here (`QT_QPA_PLATFORM=offscreen`) — not yet visually confirmed by the user on a real display. **Decision (2026-08-16, this release):** this no longer blocks `v0.1.0` — moved from "Blocked on" to a known issue, since the core CLI/headless generator and client paths are fully tested end-to-end independent of the GUI.
