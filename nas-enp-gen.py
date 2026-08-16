@@ -278,8 +278,17 @@ def fill_template(blob: dict) -> str:
             .replace("__KEYA__", blob["keya"])
             .replace("__KEYPAD__", blob["keypad"]))
 
-def deploy_instructions(out_path: str) -> str:
+def deploy_instructions(out_path: str, lang: str = "en") -> str:
     name = os.path.basename(out_path)
+    if lang == "zh":
+        return (
+            "在每台 Linux 客户端上部署（以 root 身份）：\n"
+            "  mkdir -p /root/nas-enp-mount\n"
+            f"  cp {name} /root/nas-enp-mount/\n"
+            f"  python3 /root/nas-enp-mount/{name} --selftest         # 自检\n"
+            f"  python3 /root/nas-enp-mount/{name} --install-service  # 开机自启\n"
+            "\n提醒：请使用专用、最小权限、可随时吊销的 NAS 账号。"
+        )
     return (
         "Deploy on each Linux client (as root):\n"
         "  mkdir -p /root/nas-enp-mount\n"
@@ -288,6 +297,83 @@ def deploy_instructions(out_path: str) -> str:
         f"  python3 /root/nas-enp-mount/{name} --install-service  # enable at boot\n"
         "\nReminder: use a dedicated, least-privilege, revocable NAS account."
     )
+
+# ------------------------------------------------------------------ i18n
+STRINGS = {
+    "en": {
+        "window_title": "nas-enp-mount generator",
+        "language": "Language:",
+        "protocol": "Protocol:",
+        "host": "NAS host/IP:",
+        "username": "Username:",
+        "password": "Password:",
+        "domain": "Domain (optional):",
+        "default_options": "Default mount options:",
+        "mounts_label": "Mounts:",
+        "add_mount": "Add mount",
+        "remove": "Remove",
+        "remote_placeholder": "remote path on NAS",
+        "local_placeholder": "local mount point",
+        "options_placeholder": "per-mount options (optional)",
+        "retry_attempts": "Retry attempts:",
+        "retry_delay": "Retry delay (sec):",
+        "install_deps": "Auto-install cifs-utils if missing",
+        "out_path": "Output path:",
+        "save_config": "Save config to:",
+        "save_config_placeholder": "(optional) also save config JSON to ...",
+        "generate": "Generate",
+        "invalid_config_title": "Invalid configuration",
+        "done_title": "Done",
+        "close": "Close",
+        "script_written": "Client script written to: {path}\n\n",
+    },
+    "zh": {
+        "window_title": "nas-enp-mount 生成器",
+        "language": "语言：",
+        "protocol": "协议：",
+        "host": "NAS 主机/IP：",
+        "username": "用户名：",
+        "password": "密码：",
+        "domain": "域（可选）：",
+        "default_options": "默认挂载选项：",
+        "mounts_label": "挂载点：",
+        "add_mount": "添加挂载",
+        "remove": "移除",
+        "remote_placeholder": "NAS 上的远程路径",
+        "local_placeholder": "本地挂载点",
+        "options_placeholder": "单项挂载选项（可选）",
+        "retry_attempts": "重试次数：",
+        "retry_delay": "重试间隔（秒）：",
+        "install_deps": "缺失时自动安装 cifs-utils",
+        "out_path": "输出路径：",
+        "save_config": "保存配置到：",
+        "save_config_placeholder": "（可选）同时保存配置 JSON 到……",
+        "generate": "生成",
+        "invalid_config_title": "配置无效",
+        "done_title": "完成",
+        "close": "关闭",
+        "script_written": "客户端脚本已写入：{path}\n\n",
+    },
+}
+
+# validate() (shared with --config/--cli headless paths) always raises English
+# messages via sys.exit; this maps the known ones for the GUI's message box
+# only. Unrecognized messages fall back to the original English text.
+VALIDATE_MSG_ZH = {
+    "protocol must be cifs or nfs": "协议必须是 cifs 或 nfs",
+    "host is required": "必须填写主机地址",
+    "cifs requires a username": "CIFS 协议需要用户名",
+    "at least one mount is required": "至少需要一个挂载项",
+}
+
+def translate_validation_msg(msg: str, lang: str) -> str:
+    if lang != "zh":
+        return msg
+    if msg in VALIDATE_MSG_ZH:
+        return VALIDATE_MSG_ZH[msg]
+    if msg.startswith("each mount needs 'remote' and 'local': "):
+        return "每个挂载项都需要 'remote' 和 'local'：" + msg.split(": ", 1)[1]
+    return msg
 
 # ------------------------------------------------------------------ gui
 def _pip_install(pkg: str):
@@ -322,22 +408,27 @@ def launch_gui():
         QComboBox, QCheckBox, QSpinBox, QPushButton, QLabel, QMessageBox,
         QPlainTextEdit, QDialog,
     )
+    from PySide6.QtCore import QLocale
 
     class MountRow(QWidget):
-        def __init__(self, on_remove):
+        def __init__(self, on_remove, strings):
             super().__init__()
             layout = QHBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
             self.remote = QLineEdit()
-            self.remote.setPlaceholderText("remote path on NAS")
             self.local = QLineEdit()
-            self.local.setPlaceholderText("local mount point")
             self.options = QLineEdit()
-            self.options.setPlaceholderText("per-mount options (optional)")
-            remove_btn = QPushButton("Remove")
-            remove_btn.clicked.connect(lambda: on_remove(self))
-            for w in (self.remote, self.local, self.options, remove_btn):
+            self.remove_btn = QPushButton()
+            self.remove_btn.clicked.connect(lambda: on_remove(self))
+            for w in (self.remote, self.local, self.options, self.remove_btn):
                 layout.addWidget(w)
+            self.retranslate(strings)
+
+        def retranslate(self, strings):
+            self.remote.setPlaceholderText(strings["remote_placeholder"])
+            self.local.setPlaceholderText(strings["local_placeholder"])
+            self.options.setPlaceholderText(strings["options_placeholder"])
+            self.remove_btn.setText(strings["remove"])
 
         def to_dict(self):
             return {"remote": self.remote.text().strip(),
@@ -347,71 +438,114 @@ def launch_gui():
     class GeneratorWindow(QWidget):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("nas-enp-mount generator")
             self.mount_rows = []
+            self.lang = "zh" if QLocale.system().name().startswith("zh") else "en"
 
             root = QVBoxLayout(self)
-            form = QFormLayout()
+
+            lang_row = QHBoxLayout()
+            self.lang_label = QLabel()
+            self.lang_combo = QComboBox()
+            self.lang_combo.addItem("English", "en")
+            self.lang_combo.addItem("中文", "zh")
+            self.lang_combo.setCurrentIndex(1 if self.lang == "zh" else 0)
+            self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
+            lang_row.addWidget(self.lang_label)
+            lang_row.addWidget(self.lang_combo)
+            lang_row.addStretch()
+            root.addLayout(lang_row)
+
+            self.form = QFormLayout()
 
             self.protocol = QComboBox()
             self.protocol.addItems(["cifs", "nfs"])
             self.protocol.currentTextChanged.connect(self._on_protocol_changed)
-            form.addRow("Protocol:", self.protocol)
+            self.form.addRow(" ", self.protocol)
 
             self.host = QLineEdit()
-            form.addRow("NAS host/IP:", self.host)
+            self.form.addRow(" ", self.host)
 
             self.username = QLineEdit()
-            form.addRow("Username:", self.username)
+            self.form.addRow(" ", self.username)
 
             self.password = QLineEdit()
             self.password.setEchoMode(QLineEdit.Password)
-            form.addRow("Password:", self.password)
+            self.form.addRow(" ", self.password)
 
             self.domain = QLineEdit()
-            form.addRow("Domain (optional):", self.domain)
+            self.form.addRow(" ", self.domain)
 
             self.default_options = QLineEdit()
-            form.addRow("Default mount options:", self.default_options)
+            self.form.addRow(" ", self.default_options)
 
-            root.addLayout(form)
-            root.addWidget(QLabel("Mounts:"))
+            root.addLayout(self.form)
+            self.mounts_label = QLabel()
+            root.addWidget(self.mounts_label)
             self.mounts_box = QVBoxLayout()
             root.addLayout(self.mounts_box)
-            add_mount_btn = QPushButton("Add mount")
-            add_mount_btn.clicked.connect(self._add_mount_row)
-            root.addWidget(add_mount_btn)
+            self.add_mount_btn = QPushButton()
+            self.add_mount_btn.clicked.connect(self._add_mount_row)
+            root.addWidget(self.add_mount_btn)
 
-            form2 = QFormLayout()
+            self.form2 = QFormLayout()
             self.retry_attempts = QSpinBox()
             self.retry_attempts.setRange(1, 100)
             self.retry_attempts.setValue(5)
-            form2.addRow("Retry attempts:", self.retry_attempts)
+            self.form2.addRow(" ", self.retry_attempts)
 
             self.retry_delay = QSpinBox()
             self.retry_delay.setRange(1, 3600)
             self.retry_delay.setValue(5)
-            form2.addRow("Retry delay (sec):", self.retry_delay)
+            self.form2.addRow(" ", self.retry_delay)
 
-            self.install_deps = QCheckBox("Auto-install cifs-utils if missing")
+            self.install_deps = QCheckBox()
             self.install_deps.setChecked(True)
-            form2.addRow(self.install_deps)
+            self.form2.addRow(self.install_deps)
 
             self.out_path = QLineEdit("nas-enp-mount.py")
-            form2.addRow("Output path:", self.out_path)
+            self.form2.addRow(" ", self.out_path)
 
             self.save_config_path = QLineEdit()
-            self.save_config_path.setPlaceholderText("(optional) also save config JSON to ...")
-            form2.addRow("Save config to:", self.save_config_path)
+            self.form2.addRow(" ", self.save_config_path)
 
-            root.addLayout(form2)
+            root.addLayout(self.form2)
 
-            gen_btn = QPushButton("Generate")
-            gen_btn.clicked.connect(self._on_generate)
-            root.addWidget(gen_btn)
+            self.gen_btn = QPushButton()
+            self.gen_btn.clicked.connect(self._on_generate)
+            root.addWidget(self.gen_btn)
 
             self._on_protocol_changed(self.protocol.currentText())
             self._add_mount_row()
+            self.retranslate()
+
+        def _strings(self):
+            return STRINGS[self.lang]
+
+        def _on_lang_changed(self):
+            self.lang = self.lang_combo.currentData()
+            self.retranslate()
+
+        def retranslate(self):
+            s = self._strings()
+            self.setWindowTitle(s["window_title"])
+            self.lang_label.setText(s["language"])
+            self.form.labelForField(self.protocol).setText(s["protocol"])
+            self.form.labelForField(self.host).setText(s["host"])
+            self.form.labelForField(self.username).setText(s["username"])
+            self.form.labelForField(self.password).setText(s["password"])
+            self.form.labelForField(self.domain).setText(s["domain"])
+            self.form.labelForField(self.default_options).setText(s["default_options"])
+            self.mounts_label.setText(s["mounts_label"])
+            self.add_mount_btn.setText(s["add_mount"])
+            self.form2.labelForField(self.retry_attempts).setText(s["retry_attempts"])
+            self.form2.labelForField(self.retry_delay).setText(s["retry_delay"])
+            self.install_deps.setText(s["install_deps"])
+            self.form2.labelForField(self.out_path).setText(s["out_path"])
+            self.form2.labelForField(self.save_config_path).setText(s["save_config"])
+            self.save_config_path.setPlaceholderText(s["save_config_placeholder"])
+            self.gen_btn.setText(s["generate"])
+            for row in self.mount_rows:
+                row.retranslate(s)
 
         def _on_protocol_changed(self, protocol):
             if protocol == "cifs":
@@ -421,7 +555,7 @@ def launch_gui():
                 self.default_options.setText("vers=4,soft,timeo=50,retrans=3")
 
         def _add_mount_row(self):
-            row = MountRow(self._remove_mount_row)
+            row = MountRow(self._remove_mount_row, self._strings())
             self.mount_rows.append(row)
             self.mounts_box.addWidget(row)
 
@@ -449,11 +583,13 @@ def launch_gui():
             }
 
         def _on_generate(self):
+            s = self._strings()
             cfg = self._collect_config()
             try:
                 validate(cfg)
             except SystemExit as e:
-                QMessageBox.critical(self, "Invalid configuration", str(e))
+                QMessageBox.critical(self, s["invalid_config_title"],
+                                      translate_validation_msg(str(e), self.lang))
                 return
 
             out_path = self.out_path.text().strip() or "nas-enp-mount.py"
@@ -471,12 +607,13 @@ def launch_gui():
             os.chmod(out_abs, 0o700)
 
             dlg = QDialog(self)
-            dlg.setWindowTitle("Done")
+            dlg.setWindowTitle(s["done_title"])
             layout = QVBoxLayout(dlg)
-            text = QPlainTextEdit(f"Client script written to: {out_abs}\n\n" + deploy_instructions(out_abs))
+            text = QPlainTextEdit(
+                s["script_written"].format(path=out_abs) + deploy_instructions(out_abs, lang=self.lang))
             text.setReadOnly(True)
             layout.addWidget(text)
-            close_btn = QPushButton("Close")
+            close_btn = QPushButton(s["close"])
             close_btn.clicked.connect(dlg.accept)
             layout.addWidget(close_btn)
             dlg.resize(600, 400)

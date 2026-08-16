@@ -6,7 +6,7 @@ A two-part tool for auto-mounting NAS shares on Linux clients without leaving th
 
 ## What it does
 
-- **`nas-enp-gen.py`** (the *generator*, runs on your workstation) — takes NAS connection details and mount mappings, AES-256-GCM encrypts them, and writes a self-contained Python client script that embeds the ciphertext. Run it with no arguments for a **GUI form** (PySide6), or `--config`/`--cli` for headless/scripted use. Also shipped as installable **`.deb`** (Linux) and **`.exe`** (Windows) desktop apps — see Install.
+- **`nas-enp-gen.py`** (the *generator*, runs on your workstation) — takes NAS connection details and mount mappings, AES-256-GCM encrypts them, and writes a self-contained Python client script that embeds the ciphertext. Run it with no arguments for a **GUI form** (PySide6, switchable **English / 中文** via the language dropdown in the top-left corner — defaults to your system locale), or `--config`/`--cli` for headless/scripted use. Also shipped as installable **`.deb`** (Linux) and **`.exe`** (Windows) desktop apps — see Install.
 - **The generated script** (the *client*) — drop it on each Linux box (Debian/Ubuntu), run as root with `python3`; it mounts the configured shares and can install itself as a systemd boot service.
 
 Non-goals: this does not make credentials unrecoverable on a client that has root access — see the security note below. It is not a general-purpose secrets manager.
@@ -38,6 +38,19 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.json config.json   # then fill in real NAS details, see Configuration
 ```
+
+## Building the installers locally
+
+CI (`.github/workflows/release-installers.yml`) builds both installers automatically on every `v*.*.*` tag. To build one yourself instead:
+
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller packaging/nas-enp-gen.spec
+```
+
+Output: `dist/nas-enp-gen` (Linux) or `dist/nas-enp-gen.exe` (Windows). On Linux, wrap it into a `.deb` with `packaging/build-deb.sh`.
+
+**Windows gotcha:** run `pyinstaller`, not `python pyinstaller` — it's a standalone console command installed by `pip`, not a script you pass to `python`. If `pyinstaller` isn't found on `PATH` (common with the Microsoft Store Python alias, whose `Scripts` folder often isn't on `PATH`), use `python -m PyInstaller packaging\nas-enp-gen.spec` instead — that always works regardless of `PATH`.
 
 ## Quick start
 

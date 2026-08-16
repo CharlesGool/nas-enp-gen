@@ -8,6 +8,13 @@ already-rejected option gets recommended again two weeks later.
 
 ---
 
+## 2026-08-16 — Bilingual (English/中文) GUI
+
+- **Context:** User visually confirmed the PySide6 GUI runs correctly on a real Windows display (the first real, non-offscreen verification of it) and asked for Chinese-language support, "做成双语的" (make it bilingual), for the GUI itself — distinct from the project's existing docs bilingual convention (README/DESIGN already have English + `.zh.md` pairs).
+- **Decision:** Added a `STRINGS` dict (`en`/`zh`) covering every GUI label, button, placeholder, and dialog string, plus a language dropdown in the window's top-left corner that live-retranslates the form via a `retranslate()` method (including dynamically-added mount rows, via `MountRow.retranslate()`). Default language is auto-detected from `QLocale.system().name()` (zh if the system locale starts with "zh", else English), user can switch at any time. `validate()`'s error messages (shared with the `--config`/`--cli` headless paths) stay English-only at the source; the GUI translates the known ones for its message box via a small `VALIDATE_MSG_ZH` lookup rather than refactoring the shared `validate()` function to be locale-aware — keeps the headless/scripted path's output stable for anything parsing it.
+- **Rejected:** Full Qt Linguist `.ts`/`.qm` translation workflow (`pyside6-lupdate`/`pyside6-lrelease`) — rejected as overkill for a ~25-string form; would add a build step and tooling dependency for no real benefit at this size. Localizing `validate()` itself — rejected to avoid a shared function having two different message-format contracts depending on caller.
+- **Consequences:** Adding new GUI strings in the future means updating both `STRINGS["en"]` and `STRINGS["zh"]` together, or the missing key throws a `KeyError` at `retranslate()` time — there's no fallback-to-English-if-missing. Terminal `--cli` prompts (`prompt_config()`) and `--help` text remain English-only; only the GUI got bilingual support, matching the user's request scope ("客户端GUI 双语，其他的让他们自己用cli").
+
 ## 2026-08-16 — Replace the Go client with a pure-Python client
 
 - **Context:** User confirmed every deployment target for this project guarantees a Python environment. The Go client's stated advantage (single static binary, zero client runtime deps, small attack surface — see the earlier "Tech stack" entry in `DESIGN.md`) stops mattering once that guarantee holds, and it was actively costing usability: the generator (and previously, even `--no-build`) needed a Go toolchain just to produce or emit the client, and the client itself needed cross-compilation per target arch.
