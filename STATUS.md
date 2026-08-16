@@ -2,7 +2,7 @@
 
 **Version:** unreleased · **Branch:** main
 **Notion:** not yet synced
-**Repo:** not yet created (private, pending first push)
+**Repo:** https://github.com/CharlesGool/nas-enp-gen (private)
 **Snapshots:** `/root/MyGithub_Project/nas-enp-gen/snapshots` (none yet — first snapshot is cut at v0.1.0)
 **In progress:** normalized the project to full-tier structure per the project-management skill (doc skeleton, `.gitignore`, `requirements.txt`, sanitized `config.example.json`).
 **Next:** fix the `--no-build` bug below (or decide to accept it), install a Go toolchain to verify the real `go build` path, then cut `v0.1.0` once the release checklist passes.
