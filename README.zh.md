@@ -39,8 +39,8 @@
 
 ```bash
 # 一律拉取 tag，不要拉默认分支——分支尖端可能是半成品。
-# 最新发布 tag：git ls-remote --tags <repo-url>
-git clone --branch v0.1.0 --depth 1 <repo-url> nas-enp-gen
+# 最新发布 tag：git ls-remote --tags https://github.com/CharlesGool/nas-enp-gen.git
+git clone --branch v0.1.0 --depth 1 https://github.com/CharlesGool/nas-enp-gen.git nas-enp-gen
 cd nas-enp-gen
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt

@@ -37,8 +37,8 @@ Either run from source, or grab the packaged installer from the release page (bu
 
 ```bash
 # Always clone a tag, not the default branch — the branch tip may be mid-work.
-# Latest release tag: git ls-remote --tags <repo-url>
-git clone --branch v0.1.0 --depth 1 <repo-url> nas-enp-gen
+# Latest release tag: git ls-remote --tags https://github.com/CharlesGool/nas-enp-gen.git
+git clone --branch v0.1.0 --depth 1 https://github.com/CharlesGool/nas-enp-gen.git nas-enp-gen
 cd nas-enp-gen
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
