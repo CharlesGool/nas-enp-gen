@@ -602,7 +602,7 @@ def launch_gui():
             blob = encrypt_config(cfg)
             src = fill_template(blob)
             out_abs = os.path.abspath(out_path)
-            with open(out_abs, "w") as f:
+            with open(out_abs, "w", newline="\n") as f:
                 f.write(src)
             os.chmod(out_abs, 0o700)
 
@@ -654,7 +654,7 @@ def main():
     blob = encrypt_config(cfg)
     src = fill_template(blob)
     out_abs = os.path.abspath(args.out)
-    with open(out_abs, "w") as f:
+    with open(out_abs, "w", newline="\n") as f:
         f.write(src)
     os.chmod(out_abs, 0o700)
 
