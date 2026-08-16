@@ -1,0 +1,46 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+credentials*
+secrets.*
+
+# Real NAS config — only config.example.json (placeholders) is safe to commit
+config.json
+nas.local.json
+
+# Data & logs
+# `data/` (no leading slash) matches a data directory at ANY depth — data/,
+# src/data/, tests/data/. Keep it that way.
+data/
+*.log
+*.sqlite
+*.db
+
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+target/
+
+# Build output — the generated Go client (binary and/or source) and any
+# Go build cache, since these are produced by nas-enp-gen.py, not source.
+dist/
+build/
+*.egg-info/
+nas-enp-mount
+nas-enp-mount-*
+*.go
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

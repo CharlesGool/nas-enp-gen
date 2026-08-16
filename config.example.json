@@ -1,0 +1,14 @@
+{
+  "protocol": "cifs",
+  "host": "192.0.2.10",
+  "username": "your-nas-user",
+  "password": "your-nas-password",
+  "domain": "",
+  "default_options": "vers=3.0,iocharset=utf8,uid=0,gid=0,file_mode=0644,dir_mode=0755",
+  "mounts": [
+    {"remote": "/share/path", "local": "/mnt/share", "options": ""}
+  ],
+  "retry_attempts": 5,
+  "retry_delay_sec": 5,
+  "install_deps": true
+}
