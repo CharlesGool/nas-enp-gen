@@ -4,6 +4,11 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.1.2 — document the bootstrap-circularity trap
+
+### Changed
+- `DESIGN.md` / `DESIGN.zh.md`: documented a deployment trap hit on this project's own host — keeping the only copy of the config (or of the generated client) on a share that this tool itself mounts deadlocks recovery, because unmounting that share makes the config needed to remount it unreadable. Recovery then requires re-cloning the repo, re-running `--emit-collector` on the target machine, and regenerating the client from scratch. Documentation only; no behavior change to the generator or the client.
+
 ## v0.1.1 — fix invalid UTF-8 in generated scripts
 
 ### Fixed
