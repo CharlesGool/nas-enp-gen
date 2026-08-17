@@ -2,7 +2,7 @@
 
 [English](DESIGN.md) | **简体中文**
 
-> 译自 `DESIGN.md`（v0.1.2）。如有冲突，以英文版为准。
+> 译自 `DESIGN.md`（v0.1.3）。如有冲突，以英文版为准。
 
 > 本文档的成败标准：另一个人拿着它，在另一台设备上能把项目重建出来。写的时候假设读者看不到你的机器。
 
@@ -233,7 +233,7 @@ SHA-256，得到一个 64 位十六进制指纹。采集逻辑只写了一份
 | `username` | NAS 账号 | — | 是（CIFS） |
 | `password` | NAS 账号密码 | — | 是（CIFS） |
 | `domain` | Windows 域（如有） | `""` | 否 |
-| `default_options` | 未单独覆盖时，应用到每个共享的挂载选项 | — | 是 |
+| `default_options` | 未单独覆盖时，应用到每个共享的挂载选项 | CIFS：`vers=3.0,iocharset=utf8,uid=0,gid=0,file_mode=0644,dir_mode=0755,hard,actimeo=30` · NFS：`vers=4,soft,timeo=50,retrans=3` | 是 |
 | `mounts` | `{remote, local, options}` 数组 | — | 是，至少一项 |
 | `retry_attempts` | 客户端挂载重试次数 | — | 是 |
 | `retry_delay_sec` | 重试间隔秒数 | — | 是 |
@@ -245,6 +245,17 @@ SHA-256，得到一个 64 位十六进制指纹。采集逻辑只写了一份
 别是什么，`--config`/`--cli` 路径和 GUI 路径都一样。这是刻意的：无论
 悄悄默认成哪一种（自动绑定，或悄悄退回不设防），都是代替用户做出了一
 个有安全含义的选择，而且是让人意外的那种。
+
+**为什么 CIFS 默认值明确设了 `hard,actimeo=30`（v0.1.3 新增）：** 不设
+这两项并不等于"没有倾向"——内核 `cifs.ko` 在挂载选项没写明时，会悄悄
+套用 `soft` 和 `actimeo=1`（见 `man mount.cifs`），而这个组合正是一次
+真实故障的元凶：在一个 soft 挂载的共享上，`git` 高频元数据操作期间，
+服务端一次瞬时的 lease-break 应答延迟，让 `.git/index` 上的一次
+`rename()` 永久性返回 `EACCES`，而不是被内核重试，这个文件就一直卡死
+直到挂载被刷新。`hard` 让瞬时抖动变成阻塞重试而不是直接报错；
+`actimeo=30` 则在高频 git 操作期间减少对服务端属性状态的轮询次数。完
+整故障复盘与被否决的备选方案见 `DECISIONS.md` 2026-08-17「Default
+CIFS mount options」条目。
 
 生成器自身的命令行参数：`--config`（无界面/脚本化）、`--cli`（强制走
 老的终端提示流程而不是 GUI）、`--out`、`--save-config`（把收集到的配

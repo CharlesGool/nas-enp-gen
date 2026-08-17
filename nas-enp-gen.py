@@ -51,6 +51,25 @@ try:
 except ImportError:
     sys.exit("Missing dependency. Run:  pip install cryptography")
 
+# Suggested defaults for the "Default mount options" wizard/GUI field. The
+# ONE canonical copy, shared by the CLI prompt and the GUI so they can't
+# drift apart (see DECISIONS.md 2026-08-17 "Default CIFS mount options").
+#
+# `hard` and `actimeo=30` are explicit here because leaving them unset does
+# NOT mean "no opinion" - the kernel's cifs.ko silently fills in `soft` and
+# `actimeo=1` (see `man mount.cifs`), and that combination is exactly what
+# caused a real, reproduced incident: under heavy `git` metadata churn on a
+# soft-mounted share, a transient server-side lease-break ack delay made a
+# `rename()` on `.git/index` return EACCES permanently instead of the
+# kernel retrying, wedging the file until the mount was refreshed. `hard`
+# makes transient hiccups block-and-retry instead of erroring out; a longer
+# `actimeo` cuts down on-the-wire attribute checks during rapid git
+# operations. Users who type their own `default_options` (CLI/GUI) or a
+# per-mount override are unaffected - this only changes what a fresh run
+# suggests when someone accepts the default.
+DEFAULT_CIFS_OPTIONS = "vers=3.0,iocharset=utf8,uid=0,gid=0,file_mode=0644,dir_mode=0755,hard,actimeo=30"
+DEFAULT_NFS_OPTIONS = "vers=4,soft,timeo=50,retrans=3"
+
 # ---- Shared fingerprint-collection logic ----
 # The ONE canonical copy. Spliced verbatim into both the client template
 # (replacing the "# __FINGERPRINT_LOGIC__" marker below) and the
@@ -391,13 +410,12 @@ def prompt_config() -> dict:
 
     if protocol == "cifs":
         default_options = (input(
-            "Default mount options "
-            "(Enter for 'vers=3.0,iocharset=utf8,uid=0,gid=0,file_mode=0644,dir_mode=0755'): "
-        ).strip() or "vers=3.0,iocharset=utf8,uid=0,gid=0,file_mode=0644,dir_mode=0755")
+            f"Default mount options (Enter for '{DEFAULT_CIFS_OPTIONS}'): "
+        ).strip() or DEFAULT_CIFS_OPTIONS)
     else:
         default_options = (input(
-            "Default NFS options (Enter for 'vers=4,soft,timeo=50,retrans=3'): "
-        ).strip() or "vers=4,soft,timeo=50,retrans=3")
+            f"Default NFS options (Enter for '{DEFAULT_NFS_OPTIONS}'): "
+        ).strip() or DEFAULT_NFS_OPTIONS)
 
     mounts = []
     print("\nNow add mount mappings. Empty remote path finishes.\n")
@@ -935,10 +953,9 @@ def launch_gui():
 
         def _on_protocol_changed(self, protocol):
             if protocol == "cifs":
-                self.default_options.setText(
-                    "vers=3.0,iocharset=utf8,uid=0,gid=0,file_mode=0644,dir_mode=0755")
+                self.default_options.setText(DEFAULT_CIFS_OPTIONS)
             else:
-                self.default_options.setText("vers=4,soft,timeo=50,retrans=3")
+                self.default_options.setText(DEFAULT_NFS_OPTIONS)
 
         def _add_mount_row(self):
             row = MountRow(self._remove_mount_row, self._strings())

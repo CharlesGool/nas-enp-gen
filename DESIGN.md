@@ -240,7 +240,7 @@ Fields of the JSON config consumed by `nas-enp-gen.py --config <file>` (see `con
 | `username` | NAS account | — | yes (CIFS) |
 | `password` | NAS account password | — | yes (CIFS) |
 | `domain` | Windows domain, if any | `""` | no |
-| `default_options` | mount options applied to every share unless overridden | — | yes |
+| `default_options` | mount options applied to every share unless overridden | CIFS: `vers=3.0,iocharset=utf8,uid=0,gid=0,file_mode=0644,dir_mode=0755,hard,actimeo=30` · NFS: `vers=4,soft,timeo=50,retrans=3` | yes |
 | `mounts` | array of `{remote, local, options}` | — | yes, at least one |
 | `retry_attempts` | client-side mount retry count | — | yes |
 | `retry_delay_sec` | seconds between retries | — | yes |
@@ -253,6 +253,18 @@ naming both options, on both the `--config`/`--cli` and GUI paths. This is
 deliberate: silently defaulting either way (auto-binding, or silently
 falling back to unprotected) would be a surprising, security-relevant
 choice made on the user's behalf.
+
+**Why the CIFS default sets `hard,actimeo=30` explicitly (added v0.1.3):**
+leaving these unset is not "no opinion" — the kernel's `cifs.ko` silently
+applies `soft` and `actimeo=1` (see `man mount.cifs`), and that exact
+combination caused a real incident: under heavy `git` metadata churn on a
+soft-mounted share, a transient server-side lease-break ack delay made a
+`rename()` on `.git/index` return `EACCES` permanently instead of the
+kernel retrying, wedging the file until the mount was refreshed. `hard`
+makes transient hiccups block-and-retry instead of erroring out;
+`actimeo=30` cuts down on-the-wire attribute checks during rapid git
+operations. See `DECISIONS.md` 2026-08-17 "Default CIFS mount options"
+for the full incident writeup and alternatives considered.
 
 CLI flags of the generator itself: `--config` (headless/scripted), `--cli` (force the old terminal-prompt flow instead of the GUI), `--out`, `--save-config` (writes the collected config back out — contains the password in cleartext, guard it), `--emit-collector [--out PATH]` (writes a standalone, dependency-free fingerprint-collection script for a target machine; default `nas-enp-fingerprint.py`). No arguments launches the PySide6 GUI. `--arch` and `--no-build` were removed — there is no build/compile step anymore.
 

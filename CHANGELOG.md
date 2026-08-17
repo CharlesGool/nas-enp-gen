@@ -4,6 +4,11 @@ Newest version first. Only changes a user can perceive — internal refactors do
 not need an entry. Draft from `git log <previous-tag>..HEAD --oneline`, then
 rewrite in user-facing terms.
 
+## v0.1.3 — fix default CIFS mount options that could wedge a file under heavy load
+
+### Fixed
+- The generator's suggested default CIFS mount options didn't set `hard`/`actimeo`, so the Linux kernel silently fell back to its own `soft` + `actimeo=1` defaults. On a real deployment, that combination let a transient server-side hiccup during heavy `git` activity turn into a permanently wedged file (`rename()` failing with `EACCES` until the mount was refreshed). The generator (CLI and GUI) now suggests `hard,actimeo=30` explicitly by default, so accepting the wizard's suggestion no longer reproduces this failure mode. Anyone who already typed custom `default_options`, or wants fail-fast `soft` semantics on purpose, is unaffected — this only changes the suggested default. See `DECISIONS.md` 2026-08-17 "Default CIFS mount options" for the full incident writeup. Added a regression test (`tests/test_defaults.py`).
+
 ## v0.1.2 — document the bootstrap-circularity trap
 
 ### Changed
