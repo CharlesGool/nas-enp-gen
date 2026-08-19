@@ -1,4 +1,4 @@
-# nas-enp-mount — Design
+# nas-enp-gen — Design
 
 **English** | [简体中文](DESIGN.zh.md)
 

@@ -12,6 +12,7 @@ item, copied verbatim.
 - [ ] 2026-08-17 regenerate and redeploy this host's own live client — it was generated before the v0.1.3 CIFS-option fix, so it still mounts with the old `soft,actimeo=1` behaviour (mount details in `../.local-notes.md`)
 - [ ] 2026-08-16 visually confirm the GUI language switcher and the binding controls on a real display — only offscreen/logic-tested here (`QT_QPA_PLATFORM=offscreen`)
 - [ ] 2026-08-16 add automated tests for the generator's non-crypto paths — GUI widget behaviour beyond smoke tests, and `packaging/`
+- [x] 2026-08-19 add `THIRD_PARTY_NOTICES.md` and state the LGPL-3.0 terms for the released `.deb`/`.exe` — see `DECISIONS.md` 2026-08-19
 - [x] 2026-08-19 migrate `STATUS.md` to the front-matter format and split the requirement list out into this file
 - [x] 2026-08-17 fix the generator's suggested default CIFS mount options (`hard,actimeo=30`) — shipped in `v0.1.3`
 - [x] 2026-08-17 document the bootstrap-circularity trap — shipped in `v0.1.2`

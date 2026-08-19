@@ -1,4 +1,4 @@
-# nas-enp-mount
+# nas-enp-gen
 
 **English** | [简体中文](README.zh.md)
 
@@ -164,3 +164,10 @@ see `DESIGN.md` → Configuration reference.
 ## License
 
 Apache License 2.0 — see `LICENSE`.
+
+The packaged `.deb`/`.exe` on the release page bundle third-party components,
+notably **PySide6 and the Qt 6 libraries, used under the GNU LGPL version 3**,
+and a statically linked OpenSSL inside `cryptography`. Sources, attributions and
+the LGPL relinking terms are listed in `THIRD_PARTY_NOTICES.md` — read it before
+redistributing a binary. Running from source pulls those packages from PyPI
+under their own licenses and creates no combined distribution.

@@ -1,4 +1,4 @@
-# nas-enp-mount
+# nas-enp-gen
 
 [English](README.md) | **简体中文**
 
@@ -161,3 +161,9 @@ reference。
 ## 许可
 
 Apache License 2.0 —— 见 `LICENSE`。
+
+发布页上打包好的 `.deb`/`.exe` 捆绑了第三方组件，其中 **PySide6 与它携带的
+Qt 6 库按 GNU LGPL 第 3 版使用**，`cryptography` 里还静态链接了 OpenSSL。来
+源、归属声明和 LGPL 的重链接条款列在 `THIRD_PARTY_NOTICES.md`——在转发二进
+制文件之前请先读它。从源码运行时这些包由 PyPI 按各自许可证安装，不构成组
+合分发。
